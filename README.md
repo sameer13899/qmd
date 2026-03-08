@@ -97,8 +97,8 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 **Claude Code** — Install the plugin (recommended):
 
 ```bash
-claude marketplace add tobi/qmd
-claude plugin add qmd@qmd
+claude plugin marketplace add tobi/qmd
+claude plugin install qmd@qmd
 ```
 
 Or configure MCP manually in `~/.claude/settings.json`:
@@ -252,11 +252,33 @@ QMD uses three local GGUF models (auto-downloaded on first use):
 
 | Model | Purpose | Size |
 |-------|---------|------|
-| `embeddinggemma-300M-Q8_0` | Vector embeddings | ~300MB |
+| `embeddinggemma-300M-Q8_0` | Vector embeddings (default) | ~300MB |
 | `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
 | `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
+
+### Custom Embedding Model
+
+Override the default embedding model via the `QMD_EMBED_MODEL` environment variable.
+This is useful for multilingual corpora (e.g. Chinese, Japanese, Korean) where
+`embeddinggemma-300M` has limited coverage.
+
+```sh
+# Use Qwen3-Embedding-0.6B for better multilingual (CJK) support
+export QMD_EMBED_MODEL="hf:Qwen/Qwen3-Embedding-0.6B-GGUF/qwen3-embedding-0.6b-q8_0.gguf"
+
+# After changing the model, re-embed all collections:
+qmd embed -f
+```
+
+Supported model families:
+- **embeddinggemma** (default) — English-optimized, small footprint
+- **Qwen3-Embedding** — Multilingual (119 languages including CJK), MTEB top-ranked
+
+> **Note:** When switching embedding models, you must re-index with `qmd embed -f`
+> since vectors are not cross-compatible between models. The prompt format is
+> automatically adjusted for each model family.
 
 ## Installation
 
@@ -366,6 +388,7 @@ qmd query "user authentication"
 --min-score <num>  # Minimum score threshold (default: 0)
 --full             # Show full document content
 --line-numbers     # Add line numbers to output
+--explain          # Include retrieval score traces (query, JSON/CLI output)
 --index <name>     # Use named index
 
 # Output formats (for search and multi-get)
@@ -427,6 +450,9 @@ qmd search --md --full "error handling"
 
 # JSON output for scripting
 qmd query --json "quarterly reports"
+
+# Inspect how each result was scored (RRF + rerank blend)
+qmd query --json --explain "quarterly reports"
 
 # Use separate index for different knowledge base
 qmd --index work search "quarterly reports"
