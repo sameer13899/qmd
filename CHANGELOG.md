@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-03-10
+
+### Changes
+
+- `qmd skill install` copies the packaged QMD skill into
+  `~/.claude/commands/` for one-command setup. #355 (thanks @nibzard)
+
+### Fixes
+
+- Fix Qwen3-Embedding GGUF filename case — HuggingFace filenames are
+  case-sensitive, the lowercase variant returned 404. #349 (thanks @byheaven)
+- Resolve symlinked global launcher path so `qmd` works correctly when
+  installed via `npm i -g`. #352 (thanks @nibzard)
+
+## [2.0.0] - 2026-03-10
+
+QMD 2.0 declares a stable library API. The SDK is now the primary interface —
+the MCP server is a clean consumer of it, and the source is organized into
+`src/cli/` and `src/mcp/`. Also: Node 25 support and a runtime-aware bin wrapper
+for bun installs.
+
+### Changes
+
+- Stable SDK API with `QMDStore` interface — search, retrieval, collection/context
+  management, indexing, lifecycle
+- Unified `search()`: pass `query` for auto-expansion or `queries` for
+  pre-expanded lex/vec/hyde — replaces the old query/search/structuredSearch split
+- New `getDocumentBody()`, `getDefaultCollectionNames()`, `Maintenance` class
+- MCP server rewritten as a clean SDK consumer — zero internal store access
+- CLI and MCP organized into `src/cli/` and `src/mcp/` subdirectories
+- Runtime-aware `bin/qmd` wrapper detects bun vs node to avoid ABI mismatches.
+  Closes #319
+- `better-sqlite3` bumped to ^12.4.5 for Node 25 support. Closes #257
+- Utility exports: `extractSnippet`, `addLineNumbers`, `DEFAULT_MULTI_GET_MAX_BYTES`
+
+### Fixes
+
+- Remove unused `import { resolve }` in store.ts that shadowed local export
+
 ## [1.1.6] - 2026-03-09
 
 QMD can now be used as a library. `import { createStore } from '@tobilu/qmd'`
