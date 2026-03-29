@@ -2,8 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- AST-aware chunking for code files via `web-tree-sitter`. Supported
+  languages: TypeScript/JavaScript, Python, Go, and Rust. Code files
+  are chunked at function, class, and import boundaries instead of
+  arbitrary text positions. Markdown and unknown file types are unchanged.
+- `--chunk-strategy <auto|regex>` flag for `qmd embed` and `qmd query`.
+  Default is `regex` (existing behavior). Use `auto` to enable AST-aware
+  chunking for code files.
+- `qmd status` now shows AST grammar availability.
+- SDK: `chunkStrategy` option on `embed()` and `search()` methods.
+
 ### Fixes
 
+- Fix paths in nix flake 
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release
   script now use `--frozen-lockfile` to prevent recurrence. #386
   (thanks @Mic92)
