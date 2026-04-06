@@ -522,6 +522,11 @@ export function enableProductionMode(): void {
   _productionMode = true;
 }
 
+/** Reset production mode flag — only for testing. */
+export function _resetProductionModeForTesting(): void {
+  _productionMode = false;
+}
+
 export function getDefaultDbPath(indexName: string = "index"): string {
   // Always allow override via INDEX_PATH (for testing)
   if (process.env.INDEX_PATH) {
@@ -1053,7 +1058,12 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
     const hasCosine = tableInfo.sql.includes('distance_metric=cosine');
     const existingDims = match?.[1] ? parseInt(match[1], 10) : null;
     if (existingDims === dimensions && hasHashSeq && hasCosine) return;
-    // Table exists but wrong schema - need to rebuild
+    if (existingDims !== null && existingDims !== dimensions) {
+      throw new Error(
+        `Embedding dimension mismatch: existing vectors are ${existingDims}d but the current model produces ${dimensions}d. ` +
+        `Run 'qmd embed -f' to re-embed with the new model.`
+      );
+    }
     db.exec("DROP TABLE IF EXISTS vectors_vec");
   }
   db.exec(`CREATE VIRTUAL TABLE vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}] distance_metric=cosine)`);
@@ -1409,6 +1419,7 @@ export async function generateEmbeddings(
 
   // Use store's LlamaCpp or global singleton, wrapped in a session
   const llm = getLlm(store);
+  const embedModelUri = llm.embedModelName;
 
   // Create a session manager for this llm instance
   const result = await withLLMSessionForLlm(llm, async (session) => {
@@ -1466,8 +1477,8 @@ export async function generateEmbeddings(
 
       if (!vectorTableInitialized) {
         const firstChunk = batchChunks[0]!;
-        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-        const firstResult = await session.embed(firstText);
+        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, embedModelUri);
+        const firstResult = await session.embed(firstText, { model });
         if (!firstResult) {
           throw new Error("Failed to get embedding dimensions from first chunk");
         }
@@ -1498,10 +1509,10 @@ export async function generateEmbeddings(
 
         const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
         const chunkBatch = batchChunks.slice(batchStart, batchEnd);
-        const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+        const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
 
         try {
-          const embeddings = await session.embedBatch(texts);
+          const embeddings = await session.embedBatch(texts, { model });
           for (let i = 0; i < chunkBatch.length; i++) {
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
@@ -1522,8 +1533,8 @@ export async function generateEmbeddings(
           } else {
             for (const chunk of chunkBatch) {
               try {
-                const text = formatDocForEmbedding(chunk.text, chunk.title);
-                const result = await session.embed(text);
+                const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
+                const result = await session.embed(text, { model });
                 if (result) {
                   insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
                   chunksEmbedded++;
@@ -1714,6 +1725,7 @@ export function handelize(path: string): string {
 
   const result = path
     .replace(/___/g, '/')       // Triple underscore becomes folder separator
+    .toLowerCase()
     .split('/')
     .map((segment, idx, arr) => {
       const isLastSegment = idx === arr.length - 1;
@@ -1728,7 +1740,7 @@ export function handelize(path: string): string {
         const nameWithoutExt = ext ? segment.slice(0, -ext.length) : segment;
 
         const cleanedName = nameWithoutExt
-          .replace(/[^\p{L}\p{N}.$]+/gu, '-')  // Keep letters, numbers, dots, "$"; dash-separate rest
+          .replace(/[^\p{L}\p{N}$]+/gu, '-')  // Keep letters, numbers, "$"; dash-separate rest (including dots)
           .replace(/^-+|-+$/g, ''); // Remove leading/trailing dashes
 
         return cleanedName + ext;
@@ -2357,7 +2369,7 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
 
   const isMatch = picomatch(pattern);
   return allFiles
-    .filter(f => isMatch(f.virtual_path) || isMatch(f.path))
+    .filter(f => isMatch(f.virtual_path) || isMatch(f.path) || isMatch(f.collection + '/' + f.path))
     .map(f => ({
       filepath: f.virtual_path,  // Virtual path for precise lookup
       displayPath: f.path,        // Relative path for display
@@ -2762,8 +2774,8 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
 // FTS Search
 // =============================================================================
 
-function sanitizeFTS5Term(term: string): string {
-  return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
+export function sanitizeFTS5Term(term: string): string {
+  return term.replace(/[^\p{L}\p{N}'_]/gu, '').toLowerCase();
 }
 
 /**
@@ -3535,7 +3547,7 @@ export function findDocuments(
   pattern: string,
   options: { includeBody?: boolean; maxBytes?: number } = {}
 ): { docs: MultiGetResult[]; errors: string[] } {
-  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?');
+  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?') && !pattern.includes('{');
   const errors: string[] = [];
   const maxBytes = options.maxBytes ?? DEFAULT_MULTI_GET_MAX_BYTES;
 
@@ -3979,7 +3991,7 @@ export async function hybridQuery(
 
     // Batch embed all vector queries in a single call
     const llm = getLlm(store);
-    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
+    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, llm.embedModelName));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
     const embeddings = await llm.embedBatch(textsToEmbed);
@@ -4362,7 +4374,7 @@ export async function structuredSearch(
     );
     if (vecSearches.length > 0) {
       const llm = getLlm(store);
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
+      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, llm.embedModelName));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
       const embeddings = await llm.embedBatch(textsToEmbed);
