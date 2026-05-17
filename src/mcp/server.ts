@@ -42,6 +42,7 @@ type SearchResultItem = {
   title: string;
   score: number;
   context: string | null;
+  line: number;   // Absolute line in source markdown
   snippet: string;
 };
 
@@ -106,7 +107,6 @@ function getPackageVersion(): string {
  */
 async function buildInstructions(store: QMDStore): Promise<string> {
   const status = await store.getStatus();
-  const contexts = await store.listContexts();
   const globalCtx = await store.getGlobalContext();
   const lines: string[] = [];
 
@@ -115,15 +115,13 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   if (globalCtx) lines.push(`Context: ${globalCtx}`);
 
   // --- What's searchable? ---
+  // Emit names only — the per-collection doc counts and descriptions can run to ~1.5 KB
+  // across a dozen collections, and the same info is available on demand via the `status` tool.
   if (status.collections.length > 0) {
     lines.push("");
-    lines.push("Collections (scope with `collection` parameter):");
-    for (const col of status.collections) {
-      // Find root context for this collection
-      const rootCtx = contexts.find(c => c.collection === col.name && (c.path === "" || c.path === "/"));
-      const desc = rootCtx ? ` — ${rootCtx.context}` : "";
-      lines.push(`  - "${col.name}" (${col.documents} docs)${desc}`);
-    }
+    const names = status.collections.map(c => c.name).join(", ");
+    lines.push(`Collections (scope with \`collection\` parameter): ${names}`);
+    lines.push("Call the `status` tool for collection descriptions, paths, and per-collection doc counts.");
   }
 
   // --- Capability gaps ---
@@ -242,6 +240,8 @@ async function createMcpServer(store: QMDStore): Promise<McpServer> {
       title: "Query",
       description: `Search the knowledge base using a query document — one or more typed sub-queries combined for best recall.
 
+Each result includes a \`line\` field with the absolute 1-indexed line of the best match in the source markdown. To read more context around a hit, call \`get(file, fromLine = max(1, line - 20), maxLines = 80, lineNumbers = true)\`.
+
 ## Query Types
 
 **lex** — BM25 keyword search. Fast, exact, no LLM needed.
@@ -331,6 +331,7 @@ Intent-aware lex (C++ performance, not sports):
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
         limit,
         minScore,
+        candidateLimit,
         rerank,
         intent,
       });
@@ -341,13 +342,14 @@ Intent-aware lex (C++ performance, not sports):
         || searches[0]?.query || "";
 
       const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300, undefined, undefined, intent);
+        const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
         return {
           docid: `#${r.docid}`,
           file: r.displayPath,
           title: r.title,
           score: Math.round(r.score * 100) / 100,
           context: r.context,
+          line,
           snippet: addLineNumbers(snippet, line),
         };
       });
@@ -385,6 +387,7 @@ Intent-aware lex (C++ performance, not sports):
         parsedFromLine = parseInt(colonMatch[1], 10);
         lookup = lookup.slice(0, -colonMatch[0].length);
       }
+      if (parsedFromLine !== undefined) parsedFromLine = Math.max(1, parsedFromLine);
 
       const result = await store.get(lookup, { includeBody: false });
 
@@ -692,6 +695,7 @@ export async function startMcpHttpServer(
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
           limit: params.limit ?? 10,
           minScore: params.minScore ?? 0,
+          candidateLimit: params.candidateLimit,
           intent: params.intent,
           rerank: params.rerank,
         });
@@ -702,13 +706,14 @@ export async function startMcpHttpServer(
           || params.searches[0]?.query || "";
 
         const formatted = results.map(r => {
-          const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300);
+          const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, params.intent);
           return {
             docid: `#${r.docid}`,
             file: r.displayPath,
             title: r.title,
             score: Math.round(r.score * 100) / 100,
             context: r.context,
+            line,
             snippet: addLineNumbers(snippet, line),
           };
         });

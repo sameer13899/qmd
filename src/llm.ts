@@ -22,8 +22,44 @@ type NodeLlamaCppModule = {
 
 let nodeLlamaCppImport: Promise<NodeLlamaCppModule> | null = null;
 async function loadNodeLlamaCpp(): Promise<NodeLlamaCppModule> {
-  nodeLlamaCppImport ??= import("node-llama-cpp") as Promise<NodeLlamaCppModule>;
+  nodeLlamaCppImport ??= withNativeStdoutRedirectedToStderr(
+    () => import("node-llama-cpp") as Promise<NodeLlamaCppModule>
+  );
   return nodeLlamaCppImport;
+}
+
+export function setNodeLlamaCppModuleForTest(module: NodeLlamaCppModule | null): void {
+  nodeLlamaCppImport = module ? Promise.resolve(module) : null;
+  failedGpuInitModes.clear();
+  noGpuAccelerationWarningShown = false;
+}
+
+type StdoutWrite = typeof process.stdout.write;
+let nativeStdoutRedirectDepth = 0;
+let originalStdoutWrite: StdoutWrite | null = null;
+
+/**
+ * Some node-llama-cpp native build/probe paths write library noise to stdout.
+ * JSON APIs must reserve stdout for machine-readable payloads, so route that
+ * noise to stderr while native llama initialization is in progress.
+ */
+export async function withNativeStdoutRedirectedToStderr<T>(fn: () => Promise<T>): Promise<T> {
+  if (nativeStdoutRedirectDepth === 0) {
+    originalStdoutWrite = process.stdout.write.bind(process.stdout) as StdoutWrite;
+    process.stdout.write = ((chunk: any, encoding?: any, cb?: any) => {
+      return process.stderr.write(chunk, encoding, cb as any);
+    }) as StdoutWrite;
+  }
+  nativeStdoutRedirectDepth++;
+  try {
+    return await fn();
+  } finally {
+    nativeStdoutRedirectDepth--;
+    if (nativeStdoutRedirectDepth === 0 && originalStdoutWrite) {
+      process.stdout.write = originalStdoutWrite;
+      originalStdoutWrite = null;
+    }
+  }
 }
 
 import { homedir } from "os";
@@ -48,7 +84,7 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
  * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
-  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  const uri = modelUri ?? resolveEmbedModel();
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
@@ -61,7 +97,7 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  * Qwen3-Embedding encodes documents as raw text without special prefixes.
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
-  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  const uri = modelUri ?? resolveEmbedModel();
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
@@ -219,6 +255,32 @@ export const LFM2_INSTRUCT_MODEL = "hf:LiquidAI/LFM2.5-1.2B-Instruct-GGUF/LFM2.5
 export const DEFAULT_EMBED_MODEL_URI = DEFAULT_EMBED_MODEL;
 export const DEFAULT_RERANK_MODEL_URI = DEFAULT_RERANK_MODEL;
 export const DEFAULT_GENERATE_MODEL_URI = DEFAULT_GENERATE_MODEL;
+
+export type ModelResolutionConfig = {
+  embed?: string;
+  generate?: string;
+  rerank?: string;
+};
+
+export function resolveEmbedModel(config?: ModelResolutionConfig): string {
+  return config?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+}
+
+export function resolveGenerateModel(config?: ModelResolutionConfig): string {
+  return config?.generate || process.env.QMD_GENERATE_MODEL || DEFAULT_GENERATE_MODEL;
+}
+
+export function resolveRerankModel(config?: ModelResolutionConfig): string {
+  return config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
+}
+
+export function resolveModels(config?: ModelResolutionConfig): Required<ModelResolutionConfig> {
+  return {
+    embed: resolveEmbedModel(config),
+    generate: resolveGenerateModel(config),
+    rerank: resolveRerankModel(config),
+  };
+}
 
 // Local model cache directory
 const MODEL_CACHE_DIR = process.env.XDG_CACHE_HOME
@@ -487,7 +549,15 @@ export function resolveSafeParallelism(options: ParallelismOptions): number {
   return Math.max(1, options.computed);
 }
 
-export function resolveLlamaGpuMode(envValue = process.env.QMD_LLAMA_GPU): LlamaGpuMode {
+export function resolveLlamaGpuMode(
+  envValue = process.env.QMD_LLAMA_GPU,
+  forceCpuValue = process.env.QMD_FORCE_CPU
+): LlamaGpuMode {
+  const forceCpu = forceCpuValue?.trim().toLowerCase() ?? "";
+  if (forceCpu && !["false", "off", "none", "disable", "disabled", "0"].includes(forceCpu)) {
+    return false;
+  }
+
   const normalized = envValue?.trim().toLowerCase() ?? "";
   if (!normalized) return "auto";
   if (["false", "off", "none", "disable", "disabled", "0"].includes(normalized)) return false;
@@ -495,6 +565,23 @@ export function resolveLlamaGpuMode(envValue = process.env.QMD_LLAMA_GPU): Llama
 
   process.stderr.write(`QMD Warning: invalid QMD_LLAMA_GPU="${envValue}", using auto GPU selection.\n`);
   return "auto";
+}
+
+async function disposeWithTimeout(resourceName: string, dispose: () => Promise<void>, timeoutMs = 1000): Promise<void> {
+  const timeoutPromise = new Promise<"timeout">((resolve) => {
+    setTimeout(() => resolve("timeout"), timeoutMs).unref();
+  });
+
+  try {
+    const result = await Promise.race([dispose(), timeoutPromise]);
+    if (result === "timeout") {
+      process.stderr.write(`QMD Warning: timed out disposing ${resourceName}; continuing shutdown.\n`);
+    }
+  } catch (error) {
+    process.stderr.write(
+      `QMD Warning: failed to dispose ${resourceName} (${error instanceof Error ? error.message : String(error)}); continuing shutdown.\n`
+    );
+  }
 }
 
 function resolveExpandContextSize(configValue?: number): number {
@@ -517,6 +604,9 @@ function resolveExpandContextSize(configValue?: number): number {
   }
   return parsed;
 }
+
+const failedGpuInitModes = new Set<LlamaGpuMode>();
+let noGpuAccelerationWarningShown = false;
 
 export class LlamaCpp implements LLM {
   private readonly _ciMode = !!process.env.CI;
@@ -548,9 +638,9 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
-    this.embedModelUri = config.embedModel || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
-    this.generateModelUri = config.generateModel || process.env.QMD_GENERATE_MODEL || DEFAULT_GENERATE_MODEL;
-    this.rerankModelUri = config.rerankModel || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
+    this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
+    this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
+    this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
@@ -559,6 +649,14 @@ export class LlamaCpp implements LLM {
 
   get embedModelName(): string {
     return this.embedModelUri;
+  }
+
+  get generateModelName(): string {
+    return this.generateModelUri;
+  }
+
+  get rerankModelName(): string {
+    return this.rerankModelUri;
   }
 
   /**
@@ -668,22 +766,29 @@ export class LlamaCpp implements LLM {
 
       const { getLlama, LlamaLogLevel } = await loadNodeLlamaCpp();
       const loadLlama = async (gpu: LlamaGpuMode) =>
-        await getLlama({
+        await withNativeStdoutRedirectedToStderr(() => getLlama({
           build: allowBuild ? "autoAttempt" : "never",
           logLevel: LlamaLogLevel.error,
           gpu,
           skipDownload: !allowBuild,
-        });
+        }));
 
       let llama: Llama;
-      if (gpuMode === false) {
+      if (gpuMode === false || failedGpuInitModes.has(gpuMode)) {
+        if (gpuMode !== false && failedGpuInitModes.has(gpuMode)) {
+          process.stderr.write(
+            `QMD Warning: skipping previously failed GPU init${gpuMode === "auto" ? "" : ` for QMD_LLAMA_GPU=${gpuMode}`}, using CPU.\n`
+          );
+        }
         llama = await loadLlama(false);
       } else {
         try {
           llama = await loadLlama(gpuMode);
         } catch (err) {
-          // GPU backend (e.g. Vulkan on headless/driverless machines) can throw at init.
-          // Fall back to CPU so qmd still works.
+          // GPU backend (e.g. Vulkan/CUDA on headless/driverless machines) can throw at init.
+          // Fall back to CPU so qmd still works, and cache the failure to avoid repeated
+          // expensive native build/probe attempts in this process.
+          failedGpuInitModes.add(gpuMode);
           process.stderr.write(
             `QMD Warning: GPU init failed${gpuMode === "auto" ? "" : ` for QMD_LLAMA_GPU=${gpuMode}`} (${err instanceof Error ? err.message : String(err)}), falling back to CPU.\n`
           );
@@ -691,9 +796,10 @@ export class LlamaCpp implements LLM {
         }
       }
 
-      if (llama.gpu === false) {
+      if (llama.gpu === false && !noGpuAccelerationWarningShown) {
+        noGpuAccelerationWarningShown = true;
         process.stderr.write(
-          "QMD Warning: no GPU acceleration, running on CPU (slow). Run 'qmd status' for details.\n"
+          "QMD Warning: no GPU acceleration, running on CPU (slow). Run 'QMD_STATUS_DEVICE_PROBE=1 qmd status' for device details.\n"
         );
       }
       this.llama = llama;
@@ -1413,22 +1519,37 @@ export class LlamaCpp implements LLM {
       this.inactivityTimer = null;
     }
 
-    // Disposing llama cascades to models and contexts automatically
-    // See: https://node-llama-cpp.withcat.ai/guide/objects-lifecycle
-    // Note: llama.dispose() can hang indefinitely, so we use a timeout
-    if (this.llama) {
-      const disposePromise = this.llama.dispose();
-      const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, 1000));
-      await Promise.race([disposePromise, timeoutPromise]);
+    // Explicitly dispose in dependency order: contexts first, then models, then llama.
+    // Relying only on llama.dispose() leaves Metal resource sets alive until process
+    // finalization on Apple Silicon, where ggml_metal_device_free can abort after
+    // otherwise-successful CLI output (#368).
+    for (const ctx of this.embedContexts) {
+      await disposeWithTimeout("embedding context", () => ctx.dispose());
+    }
+    this.embedContexts = [];
+
+    for (const ctx of this.rerankContexts) {
+      await disposeWithTimeout("rerank context", () => ctx.dispose());
+    }
+    this.rerankContexts = [];
+
+    if (this.embedModel) {
+      await disposeWithTimeout("embedding model", () => this.embedModel!.dispose());
+      this.embedModel = null;
+    }
+    if (this.generateModel) {
+      await disposeWithTimeout("generation model", () => this.generateModel!.dispose());
+      this.generateModel = null;
+    }
+    if (this.rerankModel) {
+      await disposeWithTimeout("rerank model", () => this.rerankModel!.dispose());
+      this.rerankModel = null;
     }
 
-    // Clear references
-    this.embedContexts = [];
-    this.rerankContexts = [];
-    this.embedModel = null;
-    this.generateModel = null;
-    this.rerankModel = null;
-    this.llama = null;
+    if (this.llama) {
+      await disposeWithTimeout("llama runtime", () => this.llama!.dispose());
+      this.llama = null;
+    }
 
     // Clear any in-flight load/create promises
     this.embedModelLoadPromise = null;

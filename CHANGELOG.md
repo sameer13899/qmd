@@ -2,8 +2,34 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Agent skills: add `qmd skills list|get|path` to serve version-matched runtime skill instructions from the installed CLI, and make `qmd skill install` write a stable discovery stub so installed agent skills do not go stale after QMD upgrades.
+
 ### Fixes
 
+- Skill: expand the packaged QMD skill with retrieval-first workflows, structured query examples, wiki/source collection guidance, and safe fallbacks when model-backed search is unavailable.
+- Tests: make `bun run test` execute the local unit suite under both Node/Vitest and Bun (`test:node` + `test:bun`) so runtime-specific regressions are caught before CI.
+- Model config: centralize embedding/rerank/generation model resolution so `qmd embed`, `status`, `query`, `vsearch`, `pull`, SDK vector search, and `bench` use the same active `.qmd/index.yaml` model hints and environment fallbacks.
+- GPU/status: `qmd status` now uses the same embedding model identity as `qmd embed` when computing pending embeddings, so URI-backed embeddings are not incorrectly reported as pending under the legacy `embeddinggemma` alias.
+- GPU status: `qmd status` now always shows GPU mode/configuration without unsafe native probing, and CPU-fallback warnings point to `QMD_STATUS_DEVICE_PROBE=1 qmd status` for an actual backend probe. The no-GPU warning is emitted once per process instead of once per LLM instance during benchmarks.
+- GPU: add `QMD_FORCE_CPU=1` / `--no-gpu` to bypass CUDA/Vulkan/Metal probing entirely, and route native llama.cpp stdout noise to stderr so JSON output stays parseable during search/query commands.
+- Snippet line numbers: `qmd_query` (MCP), HTTP `/query`, and `qmd query`
+  (CLI JSON output and snippet headers) now return absolute source-file
+  line numbers instead of chunk-local ones, so the `line` field can be
+  passed back to `qmd_get` as `fromLine` without a separate lookup.
+  Snippet selection remains scoped to the best matching chunk
+  (preserves #149).
+- CLI: `qmd query --full` now emits the full document body in all output
+  formats (json, csv, md, xml), restoring the documented behavior of the
+  flag. Previously it returned only the best matching chunk (~3.6KB max
+  per result). Output payload for `--full` queries is now proportional
+  to total document size.
+- macOS Metal: `qmd query --json` now flushes successful JSON output and uses a safe immediate-exit path on Darwin to avoid ggml Metal finalizer aborts; other commands still dispose LLM contexts/models before the llama runtime. #368
+- Embedding: require complete chunk coverage before treating a document as
+  embedded, remove partial vectors when chunk/session failures leave a
+  document incomplete, and keep `qmd status` pending counts honest after
+  interrupted long embed runs. #637 #378
 - Embedding: `qmd embed -c <collection>` now scopes pending-doc selection
   to the requested collection instead of embedding global pending work.
   Scoped `--force` clears only collection-owned vectors, preserves shared
@@ -33,6 +59,9 @@
 - Packaging: install AST grammar WASM packages as required dependencies so
   Bun global installs include TypeScript/TSX/JavaScript grammars, and add a
   `smoke:package-grammars` verification command. #595
+- Launcher: add wrapper smoke coverage for scoped package, npm/npx,
+  Homebrew/Linuxbrew, Bun global symlink layouts, and `$BUN_INSTALL`
+  false-positive runtime selection regressions. #351 #353 #354 #356 #358 #359
 
 ## [2.1.0] - 2026-04-05
 

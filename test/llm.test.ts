@@ -13,14 +13,77 @@ import {
   getDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
   resolveLlamaGpuMode,
+  setNodeLlamaCppModuleForTest,
+  withNativeStdoutRedirectedToStderr,
   resolveParallelismOverride,
   resolveSafeParallelism,
+  resolveEmbedModel,
+  resolveGenerateModel,
+  resolveRerankModel,
+  resolveModels,
   withLLMSession,
   canUnloadLLM,
   SessionReleasedError,
   type RerankDocument,
   type ILLMSession,
 } from "../src/llm.js";
+
+describe("model name resolution", () => {
+  function withModelEnv(env: Record<string, string | undefined>, fn: () => void): void {
+    const previous = {
+      QMD_EMBED_MODEL: process.env.QMD_EMBED_MODEL,
+      QMD_GENERATE_MODEL: process.env.QMD_GENERATE_MODEL,
+      QMD_RERANK_MODEL: process.env.QMD_RERANK_MODEL,
+    };
+    try {
+      for (const [key, value] of Object.entries(env)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fn();
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  }
+
+  test("all model roles resolve config hints before env fallbacks", () => {
+    withModelEnv({
+      QMD_EMBED_MODEL: "env-embed",
+      QMD_GENERATE_MODEL: "env-generate",
+      QMD_RERANK_MODEL: "env-rerank",
+    }, () => {
+      const config = {
+        embed: "config-embed",
+        generate: "config-generate",
+        rerank: "config-rerank",
+      };
+      expect(resolveEmbedModel(config)).toBe("config-embed");
+      expect(resolveGenerateModel(config)).toBe("config-generate");
+      expect(resolveRerankModel(config)).toBe("config-rerank");
+      expect(resolveModels(config)).toEqual(config);
+    });
+  });
+
+  test("LlamaCpp constructor uses the same resolver as status/embed/query helpers", () => {
+    withModelEnv({
+      QMD_EMBED_MODEL: "env-embed",
+      QMD_GENERATE_MODEL: "env-generate",
+      QMD_RERANK_MODEL: "env-rerank",
+    }, () => {
+      const llm = new LlamaCpp({
+        embedModel: "config-embed",
+        generateModel: "config-generate",
+        rerankModel: "config-rerank",
+      });
+      expect(llm.embedModelName).toBe(resolveEmbedModel({ embed: "config-embed" }));
+      expect(llm.generateModelName).toBe(resolveGenerateModel({ generate: "config-generate" }));
+      expect(llm.rerankModelName).toBe(resolveRerankModel({ rerank: "config-rerank" }));
+    });
+  });
+});
 
 // =============================================================================
 // Singleton Tests (no model loading required)
@@ -78,6 +141,29 @@ describe("QMD_LLAMA_GPU resolution", () => {
     expect(resolveLlamaGpuMode(" cuda ")).toBe("cuda");
   });
 
+  test("QMD_FORCE_CPU disables GPU before QMD_LLAMA_GPU auto-detection", () => {
+    const prevForceCpu = process.env.QMD_FORCE_CPU;
+    process.env.QMD_FORCE_CPU = "1";
+    try {
+      expect(resolveLlamaGpuMode(undefined)).toBe(false);
+      expect(resolveLlamaGpuMode("cuda")).toBe(false);
+    } finally {
+      if (prevForceCpu === undefined) delete process.env.QMD_FORCE_CPU;
+      else process.env.QMD_FORCE_CPU = prevForceCpu;
+    }
+  });
+
+  test("QMD_FORCE_CPU ignores false-ish values", () => {
+    const prevForceCpu = process.env.QMD_FORCE_CPU;
+    process.env.QMD_FORCE_CPU = "0";
+    try {
+      expect(resolveLlamaGpuMode(undefined)).toBe("auto");
+    } finally {
+      if (prevForceCpu === undefined) delete process.env.QMD_FORCE_CPU;
+      else process.env.QMD_FORCE_CPU = prevForceCpu;
+    }
+  });
+
   test("warns and falls back to auto for unsupported values", () => {
     const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
     try {
@@ -86,6 +172,105 @@ describe("QMD_LLAMA_GPU resolution", () => {
       expect(String(stderrSpy.mock.calls[0]?.[0] || "")).toContain("QMD_LLAMA_GPU");
     } finally {
       stderrSpy.mockRestore();
+    }
+  });
+});
+
+describe("native llama stdout containment", () => {
+  test("redirects native stdout noise to stderr while JSON callers are initializing llama", async () => {
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      await withNativeStdoutRedirectedToStderr(async () => {
+        process.stdout.write("cmake build spam\n");
+        return "ok";
+      });
+
+      expect(stdoutSpy).not.toHaveBeenCalled();
+      expect(stderrSpy).toHaveBeenCalledWith("cmake build spam\n", undefined, undefined);
+    } finally {
+      stdoutSpy.mockRestore();
+      stderrSpy.mockRestore();
+    }
+  });
+
+  test("keeps native GPU failure noise off stdout and caches failed GPU init", async () => {
+    const prevGpu = process.env.QMD_LLAMA_GPU;
+    const prevForceCpu = process.env.QMD_FORCE_CPU;
+    process.env.QMD_LLAMA_GPU = "cuda";
+    delete process.env.QMD_FORCE_CPU;
+
+    const calls: unknown[] = [];
+    const fakeLlama = { gpu: false, cpuMathCores: 4 };
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile: vi.fn(),
+      LlamaChatSession: vi.fn() as any,
+      getLlama: vi.fn(async (options: Record<string, unknown>) => {
+        calls.push(options.gpu);
+        if (options.gpu === "cuda") {
+          process.stdout.write("cmake build spam\n");
+          throw new Error("CUDA unavailable");
+        }
+        return fakeLlama as any;
+      }),
+    });
+
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      const first = new LlamaCpp();
+      const second = new LlamaCpp();
+
+      await (first as any).ensureLlama();
+      await (second as any).ensureLlama();
+
+      expect(stdoutSpy).not.toHaveBeenCalled();
+      expect(stderrSpy).toHaveBeenCalledWith("cmake build spam\n", undefined, undefined);
+      expect(calls).toEqual(["cuda", false, false]);
+      expect(String(stderrSpy.mock.calls.map(call => call[0]).join(""))).toContain("skipping previously failed GPU init");
+    } finally {
+      stdoutSpy.mockRestore();
+      stderrSpy.mockRestore();
+      setNodeLlamaCppModuleForTest(null);
+      if (prevGpu === undefined) delete process.env.QMD_LLAMA_GPU;
+      else process.env.QMD_LLAMA_GPU = prevGpu;
+      if (prevForceCpu === undefined) delete process.env.QMD_FORCE_CPU;
+      else process.env.QMD_FORCE_CPU = prevForceCpu;
+    }
+  });
+
+  test("warns about CPU fallback only once per process", async () => {
+    const prevGpu = process.env.QMD_LLAMA_GPU;
+    const prevForceCpu = process.env.QMD_FORCE_CPU;
+    process.env.QMD_LLAMA_GPU = "false";
+    delete process.env.QMD_FORCE_CPU;
+
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile: vi.fn(),
+      LlamaChatSession: vi.fn() as any,
+      getLlama: vi.fn(async () => ({ gpu: false, cpuMathCores: 4 }) as any),
+    });
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      const first = new LlamaCpp();
+      const second = new LlamaCpp();
+
+      await (first as any).ensureLlama();
+      await (second as any).ensureLlama();
+
+      const stderr = String(stderrSpy.mock.calls.map(call => call[0]).join(""));
+      expect(stderr.match(/no GPU acceleration/g)?.length).toBe(1);
+      expect(stderr).toContain("QMD_STATUS_DEVICE_PROBE=1 qmd status");
+    } finally {
+      stderrSpy.mockRestore();
+      setNodeLlamaCppModuleForTest(null);
+      if (prevGpu === undefined) delete process.env.QMD_LLAMA_GPU;
+      else process.env.QMD_LLAMA_GPU = prevGpu;
+      if (prevForceCpu === undefined) delete process.env.QMD_FORCE_CPU;
+      else process.env.QMD_FORCE_CPU = prevForceCpu;
     }
   });
 });
