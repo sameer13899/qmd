@@ -26,6 +26,7 @@ import {
   extractTitle,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  getEmbeddingFingerprint,
   chunkDocument,
   chunkDocumentByTokens,
   chunkDocumentAsync,
@@ -311,15 +312,123 @@ describe("Store Creation", () => {
 
     // Check tables exist
     const tables = store.db.prepare(`
-      SELECT name FROM sqlite_master WHERE type='table' ORDER BY name
+      SELECT name FROM sqlite_master
+      WHERE type='table'
+      ORDER BY name
     `).all() as { name: string }[];
 
     const tableNames = tables.map(t => t.name);
     expect(tableNames).toContain("documents");
     expect(tableNames).toContain("documents_fts");
     expect(tableNames).toContain("content_vectors");
+    expect(tableNames).toContain("content");
     expect(tableNames).toContain("llm_cache");
     // Note: path_contexts table removed in favor of YAML-based context storage
+
+    await cleanupTestDb(store);
+  });
+
+  test("createStore defers content_vectors embed_fingerprint migration until embedding health needs it", async () => {
+    const dbPath = join(testDir, `legacy-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    const model = "hf:test/embed-model.gguf";
+    const legacyDb = openDatabase(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE content (
+        hash TEXT PRIMARY KEY,
+        doc TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        collection TEXT NOT NULL,
+        path TEXT NOT NULL,
+        title TEXT,
+        hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        modified_at TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
+        UNIQUE(collection, path)
+      );
+      CREATE TABLE content_vectors (
+        hash TEXT NOT NULL,
+        seq INTEGER NOT NULL DEFAULT 0,
+        pos INTEGER NOT NULL DEFAULT 0,
+        model TEXT NOT NULL,
+        total_chunks INTEGER NOT NULL DEFAULT 1,
+        embedded_at TEXT NOT NULL,
+        PRIMARY KEY (hash, seq)
+      )
+    `);
+    const now = new Date().toISOString();
+    legacyDb.prepare(`INSERT INTO content (hash, doc, created_at) VALUES (?, ?, ?)`).run("hash1", "# Legacy\nbody", now);
+    legacyDb.prepare(`INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active) VALUES (?, ?, ?, ?, ?, ?, 1)`).run("test", "legacy.md", "Legacy", "hash1", now, now);
+    legacyDb.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, total_chunks, embedded_at) VALUES (?, ?, ?, ?, ?, ?)`).run("hash1", 0, 0, model, 1, now);
+    legacyDb.close();
+
+    const store = createStore(dbPath);
+    let columns = store.db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
+    expect(columns.map(col => col.name)).not.toContain("embed_fingerprint");
+
+    expect(store.getHashesNeedingEmbedding(model)).toBe(1);
+
+    columns = store.db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
+    const migratedRow = store.db.prepare(`SELECT embed_fingerprint FROM content_vectors WHERE hash = ?`).get("hash1") as { embed_fingerprint: string };
+    expect(columns.map(col => col.name)).toContain("embed_fingerprint");
+    expect(migratedRow.embed_fingerprint).toBe("");
+
+    await cleanupTestDb(store);
+  });
+
+  test("content_vectors column repair runs the full ALTER series and retries the failed operation", async () => {
+    const dbPath = join(testDir, `legacy-no-seq-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    const model = "hf:test/embed-model.gguf";
+    const legacyDb = openDatabase(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE content (
+        hash TEXT PRIMARY KEY,
+        doc TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        collection TEXT NOT NULL,
+        path TEXT NOT NULL,
+        title TEXT,
+        hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        modified_at TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
+        UNIQUE(collection, path)
+      );
+      CREATE TABLE content_vectors (
+        hash TEXT NOT NULL,
+        model TEXT NOT NULL,
+        embed_fingerprint TEXT NOT NULL DEFAULT '',
+        total_chunks INTEGER NOT NULL DEFAULT 1,
+        embedded_at TEXT NOT NULL
+      )
+    `);
+    legacyDb.close();
+
+    const store = createStore(dbPath);
+    let columns = store.db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
+    expect(columns.map(col => col.name)).not.toContain("seq");
+    expect(columns.map(col => col.name)).not.toContain("pos");
+
+    store.ensureVecTable(3);
+    store.insertEmbedding("hash1", 1, 42, new Float32Array([1, 2, 3]), model, new Date().toISOString(), 2);
+
+    columns = store.db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
+    const columnNames = columns.map(col => col.name);
+    expect(columnNames).toEqual(expect.arrayContaining(["seq", "pos", "model", "embed_fingerprint", "total_chunks", "embedded_at"]));
+    expect(store.db.prepare(`SELECT seq, pos, model, total_chunks FROM content_vectors WHERE hash = ?`).get("hash1")).toEqual({
+      seq: 1,
+      pos: 42,
+      model,
+      total_chunks: 2,
+    });
 
     await cleanupTestDb(store);
   });
@@ -2301,6 +2410,23 @@ describe("Index Status", () => {
     await cleanupTestDb(store);
   });
 
+  test("embedding health treats stale fingerprints as needing re-embedding", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const model = "hf:test/embed-model.gguf";
+    const now = new Date().toISOString();
+
+    store.llm = { embedModelName: model } as any;
+    store.ensureVecTable(3);
+    await insertTestDocument(store.db, collectionName, { name: "doc1", hash: "hash1" });
+    store.insertEmbedding("hash1", 0, 0, new Float32Array([1, 2, 3]), model, now, 1, "stale1");
+
+    expect(getEmbeddingFingerprint(model)).toMatch(/^[a-f0-9]{6}$/);
+    expect(store.getHashesNeedingEmbedding()).toBe(1);
+
+    await cleanupTestDb(store);
+  });
+
   test("getIndexHealth returns health info", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -3116,9 +3242,13 @@ describe("Embedding batching", () => {
   test("generateEmbeddings does not mark a partially embedded multi-chunk document complete", async () => {
     const store = await createTestStore();
     const db = store.db;
+    let embedCalls = 0;
     const fakeLlm = {
       async embed(_text: string, _options?: { model?: string }) {
-        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+        embedCalls++;
+        return embedCalls === 1
+          ? { embedding: [0.1, 0.2, 0.3], model: "fake-embed" }
+          : null;
       },
       async embedBatch(texts: string[], _options?: { model?: string }) {
         return texts.map((_text, index) => index === 0
@@ -3140,10 +3270,47 @@ describe("Embedding batching", () => {
       const result = await generateEmbeddings(store);
 
       expect(result.errors).toBeGreaterThan(0);
+      expect(result.failures?.[0]?.attempts).toBe(3);
       expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: 0 });
       expect(db.prepare(`SELECT COUNT(*) as count FROM vectors_vec`).get()).toEqual({ count: 0 });
       expect(store.getHashesNeedingEmbedding()).toBe(1);
       expect(store.getStatus().needsEmbedding).toBe(1);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings clears chunk errors after successful retry", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = {
+      async embed(_text: string, _options?: { model?: string }) {
+        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+      },
+      async embedBatch(texts: string[], _options?: { model?: string }) {
+        return texts.map((_text, index) => index === 0
+          ? { embedding: [1, 2, 3], model: "fake-embed" }
+          : null
+        );
+      },
+    };
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(db, "docs", {
+        name: "retry-doc",
+        body: "# Retry doc\n\n" + "transient embedding failure ".repeat(260),
+      });
+
+      const result = await generateEmbeddings(store);
+
+      expect(result.errors).toBe(0);
+      expect(result.failures).toEqual([]);
+      expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: result.chunksEmbedded });
+      expect(store.getHashesNeedingEmbedding()).toBe(0);
     } finally {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
