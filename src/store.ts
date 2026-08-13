@@ -797,57 +797,101 @@ function getUserVersion(db: Database): number {
 // Gate the work behind PRAGMA user_version and apply it inside one IMMEDIATE
 // transaction: the DROP+CREATE pair is atomic across connections, and a
 // double-checked read skips it once any process has stamped the version.
+function installFtsSyncTriggers(db: Database): void {
+  db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
+  db.exec(`
+    CREATE TRIGGER documents_ai AFTER INSERT ON documents
+    WHEN new.active = 1
+    BEGIN
+      INSERT INTO documents_fts(rowid, filepath, title, body)
+      SELECT
+        new.id,
+        new.collection || '/' || new.path,
+        new.title,
+        (SELECT doc FROM content WHERE hash = new.hash)
+      WHERE new.active = 1;
+    END
+  `);
+
+  db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
+  db.exec(`
+    CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
+      DELETE FROM documents_fts WHERE rowid = old.id;
+    END
+  `);
+
+  db.exec(`DROP TRIGGER IF EXISTS documents_au`);
+  db.exec(`
+    CREATE TRIGGER documents_au AFTER UPDATE ON documents
+    BEGIN
+      -- Delete from FTS if no longer active
+      DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
+
+      -- Update FTS if still/newly active
+      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
+      SELECT
+        new.id,
+        new.collection || '/' || new.path,
+        new.title,
+        (SELECT doc FROM content WHERE hash = new.hash)
+      WHERE new.active = 1;
+    END
+  `);
+}
+
 function applyFtsSyncTriggers(db: Database): void {
   if (getUserVersion(db) >= STORE_SCHEMA_VERSION) return;
   db.exec(`BEGIN IMMEDIATE`);
   try {
     if (getUserVersion(db) < STORE_SCHEMA_VERSION) {
-      db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
-      db.exec(`
-        CREATE TRIGGER documents_ai AFTER INSERT ON documents
-        WHEN new.active = 1
-        BEGIN
-          INSERT INTO documents_fts(rowid, filepath, title, body)
-          SELECT
-            new.id,
-            new.collection || '/' || new.path,
-            new.title,
-            (SELECT doc FROM content WHERE hash = new.hash)
-          WHERE new.active = 1;
-        END
-      `);
-
-      db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
-      db.exec(`
-        CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
-          DELETE FROM documents_fts WHERE rowid = old.id;
-        END
-      `);
-
-      db.exec(`DROP TRIGGER IF EXISTS documents_au`);
-      db.exec(`
-        CREATE TRIGGER documents_au AFTER UPDATE ON documents
-        BEGIN
-          -- Delete from FTS if no longer active
-          DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
-
-          -- Update FTS if still/newly active
-          INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
-          SELECT
-            new.id,
-            new.collection || '/' || new.path,
-            new.title,
-            (SELECT doc FROM content WHERE hash = new.hash)
-          WHERE new.active = 1;
-        END
-      `);
-
+      installFtsSyncTriggers(db);
       db.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`);
     }
     db.exec(`COMMIT`);
   } catch (err) {
     db.exec(`ROLLBACK`);
     throw err;
+  }
+}
+
+/**
+ * True when documents_fts is the current standalone (filepath, title, body)
+ * table. Older schemas used fts5(name, body, content='documents'), and
+ * CREATE VIRTUAL TABLE IF NOT EXISTS will not replace them. A CJK rebuild
+ * then runs `DELETE FROM documents_fts`, which FTS5 compiles against the
+ * external content table as `SELECT T.name FROM documents AS T` — documents
+ * has no `name` column, so open throws `no such column: T.name` (#792).
+ */
+function documentsFtsSchemaIsCurrent(db: Database): boolean {
+  const row = db.prepare(
+    `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents_fts'`
+  ).get() as { sql?: string } | undefined | null;
+  const sql = (row?.sql ?? "").toLowerCase().replace(/\s+/g, "");
+  return sql.includes("filepath") && sql.includes("title") && !sql.includes("content=");
+}
+
+function recreateDocumentsFts(db: Database): void {
+  db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
+  db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
+  db.exec(`DROP TRIGGER IF EXISTS documents_au`);
+  db.exec(`DROP TABLE IF EXISTS documents_fts`);
+  db.exec(`
+    CREATE VIRTUAL TABLE documents_fts USING fts5(
+      filepath, title, body,
+      tokenize='porter unicode61'
+    )
+  `);
+  db.exec(`DELETE FROM store_config WHERE key = 'fts_cjk_normalized_version'`);
+}
+
+function ensureDocumentsFtsSchema(db: Database): void {
+  if (documentsFtsSchemaIsCurrent(db)) return;
+  recreateDocumentsFts(db);
+  // recreateDocumentsFts dropped the sync triggers. applyFtsSyncTriggers
+  // only reinstalls them when user_version is stale, so a DB that already
+  // has the current user_version would otherwise be left untriggered.
+  if (getUserVersion(db) >= STORE_SCHEMA_VERSION) {
+    installFtsSyncTriggers(db);
   }
 }
 
@@ -1026,6 +1070,8 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
+  ensureContentVectorsStatusIndex(db);
+
   // Store collections — makes the DB self-contained (no external config needed)
   db.exec(`
     CREATE TABLE IF NOT EXISTS store_collections (
@@ -1055,6 +1101,7 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
+  ensureDocumentsFtsSchema(db);
   applyFtsSyncTriggers(db);
 
   rebuildFTSForCjkNormalization(db);
@@ -1570,6 +1617,30 @@ function isContentVectorColumnError(error: unknown): boolean {
   return CONTENT_VECTOR_DESIRED_COLUMNS.some(col => message.includes(col.name));
 }
 
+/**
+ * Covering index for the embedding-status aggregations over content_vectors
+ * (getHashesNeedingEmbedding and the legacy-fingerprint scans). Without it,
+ * SQLite materializes a transient "automatic covering index" over the whole
+ * table on every execution — measured at ~3.3s per call on an 81k-row index,
+ * and the MCP server runs that query synchronously inside every `initialize`.
+ * Legacy databases can predate the (model, embed_fingerprint, total_chunks)
+ * columns: skip creation there so startup stays probe-free, and let
+ * runContentVectorColumnRepairs() add the index right after it adds the
+ * missing columns.
+ */
+function ensureContentVectorsStatusIndex(db: Database): void {
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_content_vectors_model_fingerprint
+      ON content_vectors(model, embed_fingerprint, hash, total_chunks)
+    `);
+  } catch (error) {
+    if (!isContentVectorColumnError(error)) {
+      throw error;
+    }
+  }
+}
+
 function runContentVectorColumnRepairs(db: Database): void {
   for (const column of CONTENT_VECTOR_DESIRED_COLUMNS) {
     try {
@@ -1584,6 +1655,7 @@ function runContentVectorColumnRepairs(db: Database): void {
       }
     }
   }
+  ensureContentVectorsStatusIndex(db);
 }
 
 function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T {
@@ -1995,7 +2067,13 @@ export function createStore(dbPath?: string): Store {
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, intent, store.llm),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model ?? store.llm?.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, store.llm),
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => {
+      // Cache keys must use the resolved rerank model (store.llm or the global
+      // singleton from models.rerank). Falling back to DEFAULT_RERANK_MODEL when
+      // store.llm is unset made keys stable across config swaps (#764).
+      const llm = getLlm(store);
+      return rerank(query, documents, model ?? llm.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, llm);
+    },
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -3639,6 +3717,64 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
+/** sqlite-vec rejects k above this in MATCH queries (v0.1.9). */
+const SQLITE_VEC_MAX_K = 4096;
+
+/**
+ * Max collection-scoped vectors for an exact cosine scan. Above this we fall
+ * back to global ANN with a capped over-fetch. Exact scan avoids the
+ * post-filter starvation of small collections (#791, #803); ANN remains for
+ * very large collections where a full scan would be expensive.
+ */
+const COLLECTION_VEC_EXACT_SCAN_MAX = 20_000;
+
+const VEC_HASH_SEQ_IN_CHUNK = 400;
+
+/**
+ * Exact cosine-distance scan over a known set of hash_seq keys.
+ * Uses vec_distance_cosine with chunked IN lists (no JOIN with vectors_vec).
+ */
+function exactVecScanByHashSeq(
+  db: Database,
+  embedding: number[],
+  hashSeqs: string[],
+  limit: number,
+): { hash_seq: string; distance: number }[] {
+  if (hashSeqs.length === 0 || limit <= 0) return [];
+
+  const queryVec = new Float32Array(embedding);
+  // Over-fetch a bit so multi-chunk docs can still yield `limit` unique files.
+  const fetchLimit = Math.max(limit * 3, limit);
+  const scored: { hash_seq: string; distance: number }[] = [];
+
+  for (let i = 0; i < hashSeqs.length; i += VEC_HASH_SEQ_IN_CHUNK) {
+    const chunk = hashSeqs.slice(i, i + VEC_HASH_SEQ_IN_CHUNK);
+    const placeholders = chunk.map(() => "?").join(",");
+    const rows = db.prepare(`
+      SELECT hash_seq, vec_distance_cosine(embedding, ?) AS distance
+      FROM vectors_vec
+      WHERE hash_seq IN (${placeholders})
+    `).all(queryVec, ...chunk) as { hash_seq: string; distance: number }[];
+    scored.push(...rows);
+  }
+
+  scored.sort((a, b) => a.distance - b.distance);
+  return scored.slice(0, fetchLimit);
+}
+
+function annVecScan(
+  db: Database,
+  embedding: number[],
+  k: number,
+): { hash_seq: string; distance: number }[] {
+  const vecK = Math.max(1, Math.min(SQLITE_VEC_MAX_K, k));
+  return db.prepare(`
+    SELECT hash_seq, distance
+    FROM vectors_vec
+    WHERE embedding MATCH ? AND k = ?
+  `).all(new Float32Array(embedding), vecK) as { hash_seq: string; distance: number }[];
+}
+
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
@@ -3651,12 +3787,37 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // "optimize" this by combining into a single query with JOINs - it will break.
   // See: https://github.com/tobi/qmd/pull/23
 
-  // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
-  const vecResults = db.prepare(`
-    SELECT hash_seq, distance
-    FROM vectors_vec
-    WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+  // Step 1: Get vector matches from sqlite-vec (no JOINs allowed).
+  //
+  // Collection filter cannot be pushed into MATCH (sqlite-vec has no join-safe
+  // predicate here). Global ANN + post-filter starves small collections: they
+  // never enter the top-k (#791, #803). Multiplier over-fetch alone is not
+  // enough either — sqlite-vec caps k at 4096. For a collection filter we
+  // therefore exact-scan that collection's vectors when the set is small
+  // enough, and only then fall back to capped ANN + post-filter.
+  let vecResults: { hash_seq: string; distance: number }[];
+
+  if (collectionName) {
+    const collectionHashSeqs = withLazyContentVectorMigration(db, () =>
+      db.prepare(`
+        SELECT cv.hash || '_' || cv.seq AS hash_seq
+        FROM content_vectors cv
+        JOIN documents d ON d.hash = cv.hash AND d.active = 1
+        WHERE d.collection = ?
+      `).all(collectionName) as { hash_seq: string }[],
+    ).map((r) => r.hash_seq);
+
+    if (collectionHashSeqs.length === 0) return [];
+
+    if (collectionHashSeqs.length <= COLLECTION_VEC_EXACT_SCAN_MAX) {
+      vecResults = exactVecScanByHashSeq(db, embedding, collectionHashSeqs, limit);
+    } else {
+      // Large collection: ANN with over-fetch, hard-capped at sqlite-vec's max k.
+      vecResults = annVecScan(db, embedding, Math.max(limit * 30, limit * 3));
+    }
+  } else {
+    vecResults = annVecScan(db, embedding, limit * 3);
+  }
 
   if (vecResults.length === 0) return [];
 
@@ -3933,6 +4094,10 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+  const llm = llmOverride ?? getDefaultLlamaCpp();
+  // Prefer the LLM instance's resolved URI so a models.rerank swap cannot
+  // reuse another model's cache entries (#764).
+  const cacheModel = llm.rerankModelName ?? model;
 
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocsByChunk: Map<string, RerankDocument> = new Map();
@@ -3943,8 +4108,8 @@ export async function rerank(query: string, documents: { file: string; text: str
   // File path is excluded from the new cache key because the reranker score
   // depends on the chunk content, not where it came from.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk: doc.text });
-    const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
+    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk: doc.text });
+    const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model: cacheModel, chunk: doc.text });
     const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
     if (cached !== null) {
       cachedResults.set(doc.text, parseFloat(cached));
@@ -3955,15 +4120,14 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
-    const llm = llmOverride ?? getDefaultLlamaCpp();
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
+    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model: cacheModel });
 
     // Cache results by chunk text so identical chunks across files are scored once.
     const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
       const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk });
+      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
       setCachedResult(db, cacheKey, result.score.toString());
       cachedResults.set(chunk, result.score);
     }
@@ -4341,6 +4505,7 @@ export function findDocuments(
   options: { includeBody?: boolean; maxBytes?: number } = {}
 ): { docs: MultiGetResult[]; errors: string[] } {
   const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?') && !pattern.includes('{');
+  const isSingleDocid = isDocid(pattern);
   const errors: string[] = [];
   const maxBytes = options.maxBytes ?? DEFAULT_MULTI_GET_MAX_BYTES;
 
@@ -4358,24 +4523,28 @@ export function findDocuments(
 
   let fileRows: DbDocRow[];
 
-  if (isCommaSeparated) {
-    const names = pattern.split(',').map(s => s.trim()).filter(Boolean);
+  if (isCommaSeparated || isSingleDocid) {
+    const names = isCommaSeparated
+      ? pattern.split(',').map(s => s.trim()).filter(Boolean)
+      : [pattern.trim()].filter(Boolean);
     fileRows = [];
     for (const name of names) {
+      const docidMatch = isDocid(name) ? findDocumentByDocid(db, name) : null;
+      const lookupName = docidMatch?.filepath ?? name;
       let doc = db.prepare(`
         SELECT ${selectCols}
         FROM documents d
         JOIN content ON content.hash = d.hash
         WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
-      `).get(name) as DbDocRow | null;
-      if (!doc) {
+      `).get(lookupName) as DbDocRow | null;
+      if (!doc && !docidMatch) {
         doc = db.prepare(`
           SELECT ${selectCols}
           FROM documents d
           JOIN content ON content.hash = d.hash
           WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
           LIMIT 1
-        `).get(`%${name}`) as DbDocRow | null;
+        `).get(`%${lookupName}`) as DbDocRow | null;
       }
       if (doc) {
         fileRows.push(doc);

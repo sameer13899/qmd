@@ -1,7 +1,9 @@
 import { isBun, openDatabase } from "../db.js";
 import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
-import { execSync, spawn as nodeSpawn } from "child_process";
+import { spawn as nodeSpawn } from "child_process";
+import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
+import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
 import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
 import { parseArgs } from "util";
@@ -22,6 +24,7 @@ import {
   renameCollection,
   findSimilarFiles,
   findDocument,
+  findDocumentByDocid,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
   clearAllEmbeddings,
@@ -40,6 +43,7 @@ import {
   parseVirtualPath,
   buildVirtualPath,
   isVirtualPath,
+  isDocid,
   resolveVirtualPath,
   toVirtualPath,
   insertContent,
@@ -88,6 +92,7 @@ import {
   escapeCSV,
   type OutputFormat,
 } from "./formatter.js";
+import { resolveCommit } from "./version.js";
 import {
   getCollection as getCollectionFromYaml,
   listCollections as yamlListCollections,
@@ -133,11 +138,13 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
+      const llm = new LlamaCpp({
         embedModel: activeModels.embed,
         generateModel: activeModels.generate,
         rerankModel: activeModels.rerank,
-      }));
+      });
+      setDefaultLlamaCpp(llm);
+      store.llm = llm;
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -175,6 +182,18 @@ function getDbPath(): string {
 
 function getActiveIndexName(): string {
   return currentIndexName;
+}
+
+function mcpDaemonPaths(): { cacheDir: string; pidPath: string; logPath: string } {
+  const cacheDir = process.env.XDG_CACHE_HOME
+    ? resolve(process.env.XDG_CACHE_HOME, "qmd")
+    : resolve(homedir(), ".cache", "qmd");
+  const { pidFile, logFile } = mcpDaemonStateFiles(getActiveIndexName());
+  return {
+    cacheDir,
+    pidPath: resolve(cacheDir, pidFile),
+    logPath: resolve(cacheDir, logFile),
+  };
 }
 
 function setIndexName(name: string | null): void {
@@ -493,19 +512,15 @@ async function showStatus(): Promise<void> {
   console.log(`Index: ${dbPath}`);
   console.log(`Size:  ${formatBytes(indexSize)}`);
 
-  // MCP daemon status (check PID file liveness)
-  const mcpCacheDir = process.env.XDG_CACHE_HOME
-    ? resolve(process.env.XDG_CACHE_HOME, "qmd")
-    : resolve(homedir(), ".cache", "qmd");
-  const mcpPidPath = resolve(mcpCacheDir, "mcp.pid");
+  // MCP daemon status (check PID file liveness; scoped per --index)
+  const { pidPath: mcpPidPath } = mcpDaemonPaths();
   if (existsSync(mcpPidPath)) {
     const mcpPid = parseInt(readFileSync(mcpPidPath, "utf-8").trim());
-    try {
-      process.kill(mcpPid, 0);
+    if (isQmdMcpPid(mcpPid)) {
       console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpPid})`);
-    } catch {
-      unlinkSync(mcpPidPath);
-      // Stale PID file cleaned up silently
+    } else {
+      try { unlinkSync(mcpPidPath); } catch { /* ignore */ }
+      // Stale / recycled PID file cleaned up silently
     }
   }
   console.log("");
@@ -967,6 +982,26 @@ function renderFullPath(absolutePath: string, cwd: string = process.cwd()): stri
   return real;
 }
 
+/**
+ * Report rows that `--full-path` could not turn into an on-disk path.
+ *
+ * The flag's whole job is producing openable paths, so falling back to a
+ * `qmd://` URI is worth saying out loud: it means the file moved or was
+ * deleted since the last index, not that the path was normalized away. The
+ * notice goes to stderr so stdout stays machine-readable.
+ */
+function warnUnresolvedFullPaths(unresolved: number, total: number): void {
+  if (unresolved <= 0) return;
+  const subject = total === 1
+    ? "the file"
+    : `${unresolved} of ${total} results`;
+  console.error(
+    `${c.yellow}warning:${c.reset} --full-path could not resolve ${subject} on disk ` +
+    `(moved or deleted since indexing); showing qmd:// + docid instead. ` +
+    `Run 'qmd update' to refresh the index.`
+  );
+}
+
 function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean, fullPath: boolean = false): void {
   // Parse :line suffix from filename. Two forms:
   //   "file.md:100"     -> start at line 100
@@ -1025,7 +1060,8 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
   const canonicalPath = `qmd://${doc.displayPath}`;
 
   // --full-path: show the on-disk path instead of the qmd:// URL + docid, when
-  // the file actually exists. Fall back to the canonical header otherwise.
+  // the file actually exists. Fall back to the canonical header otherwise, and
+  // say so on stderr — a fallback here means the index is stale.
   let header: string;
   if (fullPath) {
     const fsPath = resolveVirtualPath(db, canonicalPath);
@@ -1033,6 +1069,7 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
       header = renderFullPath(fsPath);
     } else {
       header = docid ? `${canonicalPath}  #${docid}` : canonicalPath;
+      warnUnresolvedFullPaths(1, 1);
     }
   } else {
     header = docid ? `${canonicalPath}  #${docid}` : canonicalPath;
@@ -1072,19 +1109,24 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
 
   // Check if it's a comma-separated list or a glob pattern
   const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?') && !pattern.includes('{');
+  const isSingleDocid = isDocid(pattern);
 
   let files: { filepath: string; displayPath: string; bodyLength: number; collection?: string; path?: string }[];
 
-  if (isCommaSeparated) {
+  if (isCommaSeparated || isSingleDocid) {
     // Comma-separated list of files (can be virtual paths or relative paths)
-    const names = pattern.split(',').map(s => s.trim()).filter(Boolean);
+    const names = isCommaSeparated
+      ? pattern.split(',').map(s => s.trim()).filter(Boolean)
+      : [pattern.trim()].filter(Boolean);
     files = [];
     for (const name of names) {
       let doc: { virtual_path: string; body_length: number; collection: string; path: string } | null = null;
+      const docidMatch = isDocid(name) ? findDocumentByDocid(db, name) : null;
+      const lookupName = docidMatch?.filepath ?? name;
 
       // Handle virtual paths
-      if (isVirtualPath(name)) {
-        const parsed = parseVirtualPath(name);
+      if (isVirtualPath(lookupName)) {
+        const parsed = parseVirtualPath(lookupName);
         if (parsed) {
           // Try exact match on collection + path
           doc = db.prepare(`
@@ -1098,7 +1140,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
             WHERE d.collection = ? AND d.path = ? AND d.active = 1
           `).get(parsed.collectionName, parsed.path) as typeof doc;
         }
-      } else {
+      } else if (!docidMatch) {
         // Try exact match on path
         doc = db.prepare(`
           SELECT
@@ -1110,7 +1152,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
           JOIN content ON content.hash = d.hash
           WHERE d.path = ? AND d.active = 1
           LIMIT 1
-        `).get(name) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
+        `).get(lookupName) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
 
         // Try suffix match
         if (!doc) {
@@ -1124,7 +1166,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
             JOIN content ON content.hash = d.hash
             WHERE d.path LIKE ? AND d.active = 1
             LIMIT 1
-          `).get(`%${name}`) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
+          `).get(`%${lookupName}`) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
         }
       }
 
@@ -1139,6 +1181,10 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       } else {
         console.error(`File not found: ${name}`);
       }
+    }
+    if (isSingleDocid && files.length === 0) {
+      closeDb();
+      process.exit(1);
     }
   } else {
     // Glob pattern - matchFilesByGlob now returns virtual paths
@@ -1252,6 +1298,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   // resolved). Per result: pick the identifier and whether to show the docid.
   const identOf = (r: typeof results[number]): string => (fullPath && r.fsPath) ? r.fsPath : r.displayPath;
   const docidOf = (r: typeof results[number]): string | undefined => (fullPath && r.fsPath) ? undefined : r.docid;
+  const unresolvedCount = fullPath ? results.filter(r => !r.fsPath).length : 0;
 
   // Output based on format
   if (format === "json") {
@@ -1281,9 +1328,12 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       console.log([docidVal ? `#${docidVal}` : "", identOf(r), r.title, r.context, r.skipped ? "true" : "false", r.skipped ? r.skipReason : r.body].map(escapeField).join(","));
     }
   } else if (format === "files") {
+    // Headerless CSV: docid,filepath[,context][,status] — docid is its own
+    // field (comma-separated), matching search --format files shape so naive
+    // comma-splitting stays usable (#760).
     for (const r of results) {
       const docidVal = docidOf(r);
-      const id = docidVal ? `#${docidVal} ` : "";
+      const id = docidVal ? `#${docidVal},` : "";
       const ctx = r.context ? `,"${r.context.replace(/"/g, '""')}"` : "";
       const status = r.skipped ? "[SKIPPED]" : "";
       console.log(`${id}${identOf(r)}${ctx}${status ? `,${status}` : ""}`);
@@ -1342,6 +1392,8 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       console.log(r.body);
     }
   }
+
+  warnUnresolvedFullPaths(unresolvedCount, results.length);
 }
 
 // List files in virtual file tree
@@ -1868,86 +1920,98 @@ async function vectorIndex(
   const storeInstance = getStore();
   const db = storeInstance.db;
 
-  if (force) {
-    console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
-  }
-
-  // Check if there's work to do before starting
-  const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model);
-  if (hashesToEmbed === 0 && !force) {
-    console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
+  // Exclusive process lock — concurrent embeds race on vectors_vec (#825)
+  const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
+  if (!embedLock) {
+    console.log(EMBED_LOCK_BUSY_MESSAGE);
     closeDb();
     return;
   }
 
-  console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
-  if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
-    const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
-    const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
-    console.log(`${c.dim}Batch: ${maxDocsPerBatch} docs / ${formatBytes(maxBatchBytes)}${c.reset}\n`);
-  }
-  cursor.hide();
-  progress.indeterminate();
+  try {
+    if (force) {
+      console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
+    }
 
-  const startTime = Date.now();
+    // Check if there's work to do before starting
+    const hashesToEmbed = getHashesNeedingEmbedding(db, batchOptions?.collection, model);
+    if (hashesToEmbed === 0 && !force) {
+      console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
+      closeDb();
+      return;
+    }
 
-  const result = await generateEmbeddings(storeInstance, {
-    force,
-    model,
-    collection: batchOptions?.collection,
-    maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
-    maxBatchBytes: batchOptions?.maxBatchBytes,
-    chunkStrategy: batchOptions?.chunkStrategy,
-    maxDurationMs: batchOptions?.maxDurationMs,
-    onProgress: (info) => {
-      if (info.totalBytes === 0) return;
-      // Progress is measured by input bytes, not by chunks. The final chunk
-      // count is discovered lazily batch-by-batch, so displaying
-      // chunksEmbedded/totalChunks makes the percent look wrong when a few
-      // large documents remain. Show chunks as a count and label the byte
-      // percentage explicitly as input progress.
-      const percent = Math.min(100, (info.bytesProcessed / info.totalBytes) * 100);
-      progress.set(percent);
+    console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
+    if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
+      const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
+      const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
+      console.log(`${c.dim}Batch: ${maxDocsPerBatch} docs / ${formatBytes(maxBatchBytes)}${c.reset}\n`);
+    }
+    cursor.hide();
+    progress.indeterminate();
 
-      const elapsed = (Date.now() - startTime) / 1000;
-      const bytesPerSec = elapsed > 0 ? info.bytesProcessed / elapsed : 0;
-      const remainingBytes = Math.max(0, info.totalBytes - info.bytesProcessed);
-      const etaSec = bytesPerSec > 0 ? remainingBytes / bytesPerSec : Number.POSITIVE_INFINITY;
+    const startTime = Date.now();
 
-      const bar = renderProgressBar(percent);
-      const percentStr = percent.toFixed(0).padStart(3);
-      const throughput = bytesPerSec > 0 ? `${formatBytes(bytesPerSec)}/s` : ".../s";
-      const eta = elapsed > 2 && Number.isFinite(etaSec) ? formatETA(etaSec) : "...";
-      const inputStr = `${formatBytes(info.bytesProcessed)}/${formatBytes(info.totalBytes)} input`;
-      const chunkStr = `${formatCount(info.chunksEmbedded)} chunks`;
-      const errStr = info.errors > 0 ? ` ${c.yellow}${formatCount(info.errors)} err${c.reset}` : "";
+    const result = await generateEmbeddings(storeInstance, {
+      force,
+      model,
+      collection: batchOptions?.collection,
+      maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
+      maxBatchBytes: batchOptions?.maxBatchBytes,
+      chunkStrategy: batchOptions?.chunkStrategy,
+      maxDurationMs: batchOptions?.maxDurationMs,
+      onProgress: (info) => {
+        if (info.totalBytes === 0) return;
+        // Progress is measured by input bytes, not by chunks. The final chunk
+        // count is discovered lazily batch-by-batch, so displaying
+        // chunksEmbedded/totalChunks makes the percent look wrong when a few
+        // large documents remain. Show chunks as a count and label the byte
+        // percentage explicitly as input progress.
+        const percent = Math.min(100, (info.bytesProcessed / info.totalBytes) * 100);
+        progress.set(percent);
 
-      if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}% input${c.reset} ${c.dim}${chunkStr}${errStr} · ${inputStr} · ${throughput} · ETA ${eta}${c.reset}   `);
-    },
-  });
+        const elapsed = (Date.now() - startTime) / 1000;
+        const bytesPerSec = elapsed > 0 ? info.bytesProcessed / elapsed : 0;
+        const remainingBytes = Math.max(0, info.totalBytes - info.bytesProcessed);
+        const etaSec = bytesPerSec > 0 ? remainingBytes / bytesPerSec : Number.POSITIVE_INFINITY;
 
-  progress.clear();
-  cursor.show();
+        const bar = renderProgressBar(percent);
+        const percentStr = percent.toFixed(0).padStart(3);
+        const throughput = bytesPerSec > 0 ? `${formatBytes(bytesPerSec)}/s` : ".../s";
+        const eta = elapsed > 2 && Number.isFinite(etaSec) ? formatETA(etaSec) : "...";
+        const inputStr = `${formatBytes(info.bytesProcessed)}/${formatBytes(info.totalBytes)} input`;
+        const chunkStr = `${formatCount(info.chunksEmbedded)} chunks`;
+        const errStr = info.errors > 0 ? ` ${c.yellow}${formatCount(info.errors)} err${c.reset}` : "";
 
-  const totalTimeSec = result.durationMs / 1000;
+        if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}% input${c.reset} ${c.dim}${chunkStr}${errStr} · ${inputStr} · ${throughput} · ETA ${eta}${c.reset}   `);
+      },
+    });
 
-  if (result.chunksEmbedded === 0 && result.docsProcessed === 0) {
-    console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
-  } else {
-    console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
-    console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
-    if (result.errors > 0) {
-      console.log(`${c.yellow}⚠ ${formatCount(result.errors)} chunks still failed after retries${c.reset}`);
-      for (const failure of (result.failures ?? []).slice(0, 8)) {
-        console.log(`  ${c.dim}${failure.path}#${failure.seq} (${failure.attempts} attempts): ${failure.reason}${c.reset}`);
-      }
-      if ((result.failures?.length ?? 0) > 8) {
-        console.log(`  ${c.dim}...and ${formatCount((result.failures?.length ?? 0) - 8)} more${c.reset}`);
+    progress.clear();
+    cursor.show();
+
+    const totalTimeSec = result.durationMs / 1000;
+
+    if (result.chunksEmbedded === 0 && result.docsProcessed === 0) {
+      console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
+    } else {
+      console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
+      console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
+      if (result.errors > 0) {
+        console.log(`${c.yellow}⚠ ${formatCount(result.errors)} chunks still failed after retries${c.reset}`);
+        for (const failure of (result.failures ?? []).slice(0, 8)) {
+          console.log(`  ${c.dim}${failure.path}#${failure.seq} (${failure.attempts} attempts): ${failure.reason}${c.reset}`);
+        }
+        if ((result.failures?.length ?? 0) > 8) {
+          console.log(`  ${c.dim}...and ${formatCount((result.failures?.length ?? 0) - 8)} more${c.reset}`);
+        }
       }
     }
-  }
 
-  closeDb();
+    closeDb();
+  } finally {
+    embedLock.release();
+  }
 }
 
 // Sanitize a term for FTS5: remove punctuation except apostrophes
@@ -2157,20 +2221,37 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
     );
   };
 
-  // Helper to pick the visible path for a result. With --full-path we swap
+  // Resolve every row's visible identifier up front. With --full-path we swap
   // the qmd:// URI for the file's on-disk path via renderFullPath() (./-
-  // prefixed relative when under $PWD, absolute realpath otherwise). Falls
-  // back to qmd:// if the file is no longer resolvable on disk.
+  // prefixed relative when under $PWD, absolute realpath otherwise). A row
+  // whose file is gone from disk falls back to qmd:// and *keeps its docid*,
+  // so it stays addressable — the same per-row rule multiGet() uses. Resolving
+  // eagerly also means unresolved rows are counted before anything is printed.
   const linkDbForPaths = opts.fullPath ? getDb() : null;
-  const displayPathFor = (row: OutputRow): string => {
+  const resolutions = new Map<OutputRow, { ident: string; resolved: boolean }>();
+  for (const row of filtered) {
     // Always rebuild from displayPath so the active index name is included
     // as ?index=… for non-default indexes. row.file may not carry it.
     const qmdUri = toQmdPath(row.displayPath);
-    if (!opts.fullPath || !linkDbForPaths) return qmdUri;
-    const absolute = resolveVirtualPath(linkDbForPaths, qmdUri);
-    if (!absolute || !existsSync(absolute)) return qmdUri;
-    return renderFullPath(absolute);
-  };
+    let resolution = { ident: qmdUri, resolved: false };
+    if (opts.fullPath && linkDbForPaths) {
+      const absolute = resolveVirtualPath(linkDbForPaths, qmdUri);
+      if (absolute && existsSync(absolute)) {
+        resolution = { ident: renderFullPath(absolute), resolved: true };
+      }
+    }
+    resolutions.set(row, resolution);
+  }
+  const unresolvedCount = opts.fullPath
+    ? filtered.filter(row => !resolutions.get(row)?.resolved).length
+    : 0;
+
+  const displayPathFor = (row: OutputRow): string =>
+    resolutions.get(row)?.ident ?? toQmdPath(row.displayPath);
+  // Show the docid whenever it is still the row's identifier: always without
+  // --full-path, and with it only for rows that have no on-disk path to show.
+  const showDocid = (row: OutputRow): boolean =>
+    !opts.fullPath || !resolutions.get(row)?.resolved;
 
   if (opts.format === "json") {
     // JSON output for LLM consumption
@@ -2183,9 +2264,11 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         if (body) body = addLineNumbers(body);
         if (snippet) snippet = addLineNumbers(snippet);
       }
-      // With --full-path, omit docid (the on-disk path is the identifier).
+      // With --full-path, omit docid (the on-disk path is the identifier) —
+      // unless the path could not be resolved, in which case it is all the
+      // caller has.
       return {
-        ...(docid && !opts.fullPath && { docid: `#${docid}` }),
+        ...(docid && showDocid(row) && { docid: `#${docid}` }),
         score: Math.round(row.score * 100) / 100,
         file: displayPathFor(row),
         line: snippetInfo.line,
@@ -2237,7 +2320,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       const snippetBody = snippet.split("\n").slice(1).join("\n").toLowerCase();
       const hasMatch = query.toLowerCase().split(/\s+/).some(t => t.length > 0 && snippetBody.includes(t));
       const lineInfo = hasMatch ? `:${line}` : "";
-      const docidStr = (docid && !opts.fullPath) ? ` ${c.dim}#${docid}${c.reset}` : "";
+      const docidStr = (docid && showDocid(row)) ? ` ${c.dim}#${docid}${c.reset}` : "";
 
       if (process.stdout.isTTY && absolutePath && parsed?.path) {
         const linkLine = hasMatch ? line : 1;
@@ -2306,8 +2389,9 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         content = addLineNumbers(content);
       }
       const fileLine = `**file:** \`${visiblePath}\`\n`;
-      // With --full-path the on-disk path is the identifier; drop the docid line.
-      const docidLine = (docid && !opts.fullPath) ? `**docid:** \`#${docid}\`\n` : "";
+      // With --full-path the on-disk path is the identifier; drop the docid
+      // line unless this row had no path to show.
+      const docidLine = (docid && showDocid(row)) ? `**docid:** \`#${docid}\`\n` : "";
       const contextLine = row.context ? `**context:** ${row.context}\n` : "";
       console.log(`---\n# ${heading}\n${fileLine}${docidLine}${contextLine}\n${content}\n`);
     }
@@ -2320,15 +2404,15 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
-      const docidAttr = opts.fullPath ? "" : ` docid="#${docid}"`;
+      const docidAttr = showDocid(row) ? ` docid="#${docid}"` : "";
       console.log(`<file${docidAttr} name="${displayPathFor(row)}"${titleAttr}${contextAttr}>\n${content}\n</file>\n`);
     }
   } else {
-    // CSV format
-    const csvHeader = opts.fullPath
-      ? "score,file,title,context,line,snippet"
-      : "docid,score,file,title,context,line,snippet";
-    console.log(csvHeader);
+    // CSV format. The docid column is always present — under --full-path it is
+    // empty for rows whose on-disk path was found and carries the docid for
+    // rows that fell back to a qmd:// URI, so the columns stay positional.
+    // (multi-get's CSV already emits the docid column unconditionally.)
+    console.log("docid,score,file,title,context,line,snippet");
     for (const row of filtered) {
       const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, row.chunkLen, opts.intent);
       let content = opts.full ? row.body : snippet;
@@ -2339,13 +2423,12 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       const snippetText = content || "";
       const path = escapeCSV(displayPathFor(row));
       const tail = `${path},${escapeCSV(row.title || "")},${escapeCSV(row.context || "")},${line},${escapeCSV(snippetText)}`;
-      if (opts.fullPath) {
-        console.log(`${row.score.toFixed(4)},${tail}`);
-      } else {
-        console.log(`#${docid},${row.score.toFixed(4)},${tail}`);
-      }
+      const docidField = (docid && showDocid(row)) ? `#${docid}` : "";
+      console.log(`${docidField},${row.score.toFixed(4)},${tail}`);
     }
   }
+
+  warnUnresolvedFullPaths(unresolvedCount, filtered.length);
 }
 
 // Resolve -c collection filter: supports single string, array, or undefined.
@@ -3349,6 +3432,7 @@ function showHelp(): void {
   console.log("  --no-line-numbers          - Disable line numbers for get/multi-get");
   console.log("  --full-path                - Show on-disk paths instead of qmd:// + docid (get/multi-get/search/query)");
   console.log("                                Paths are ./-prefixed when under $PWD, absolute otherwise");
+  console.log("                                Results whose file is gone keep qmd:// + docid and warn on stderr");
   console.log("  --explain                  - Include retrieval score traces (query, CLI/--format json)");
   console.log("  --format <kind>            - Output format: cli (default) | json | csv | md | xml | files");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
@@ -3435,11 +3519,12 @@ function findCachedModelInspection(model: string): CachedModelInspection {
     if (!filename || !existsSync(DEFAULT_MODEL_CACHE_DIR)) return { path: null, invalid };
     const entries = readdirSync(DEFAULT_MODEL_CACHE_DIR, { withFileTypes: true });
     for (const entry of entries) {
-      // Skip the `<filename>.etag` HTTP sidecar that `qmd pull` writes next to
-      // each blob. It satisfies `includes(filename)` but is not a GGUF, so
-      // inspecting it as one surfaces a spurious "invalid" model in `qmd
-      // doctor` whenever readdir happens to yield the sidecar before the blob.
-      if (!entry.isFile() || entry.name.endsWith(".etag") || !entry.name.includes(filename)) continue;
+      // Only consider real `.gguf` blobs. `qmd pull` writes a `<filename>.etag`
+      // HTTP sidecar next to each download; that name also satisfies
+      // `includes(filename)`, so inspecting it as GGUF false-positives
+      // "invalid model" in `qmd doctor` whenever readdir yields the sidecar
+      // before the blob (#812).
+      if (!entry.isFile() || !entry.name.endsWith(".gguf") || !entry.name.includes(filename)) continue;
       const candidate = pathJoin(DEFAULT_MODEL_CACHE_DIR, entry.name);
       const inspection = inspectGgufFile(candidate);
       if (inspection.valid) return { path: candidate, invalid };
@@ -3964,16 +4049,13 @@ function readPackageJson(): PackageJson {
   return JSON.parse(readFileSync(pkgPath, "utf-8"));
 }
 
-async function showVersion(): Promise<void> {
+function showVersion(): void {
   const scriptDir = dirname(fileURLToPath(import.meta.url));
   const pkg = readPackageJson();
 
-  let commit = "";
-  try {
-    commit = execSync(`git -C ${scriptDir} rev-parse --short HEAD`, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
-  } catch {
-    // Not a git repo or git not available
-  }
+  // Prefer the commit stamped in at build time; fall back to the checkout's
+  // HEAD only when this really is qmd's own checkout. See src/cli/version.ts.
+  const commit = resolveCommit(scriptDir, pathResolve(scriptDir, "..", ".."));
 
   const versionStr = commit ? `${pkg.version} (${commit})` : pkg.version;
   console.log(`qmd ${versionStr}`);
@@ -3995,7 +4077,7 @@ if (isMain) {
   const cli = parseCLI();
 
   if (cli.values.version) {
-    await showVersion();
+    showVersion();
     process.exit(0);
   }
 
@@ -4146,6 +4228,22 @@ if (isMain) {
           const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
           const globPattern = cli.values.mask as string || DEFAULT_GLOB;
           const name = cli.values.name as string | undefined;
+
+          if (!existsSync(resolvedPwd)) {
+            console.error(`${c.yellow}Collection path does not exist.${c.reset}`);
+            console.error(`  Received: ${pwd}`);
+            console.error(`  Resolved: ${resolvedPwd}`);
+            console.error("Provide an existing directory and run 'qmd collection add <path>' again.");
+            process.exit(1);
+          }
+
+          if (!statSync(resolvedPwd).isDirectory()) {
+            console.error(`${c.yellow}Collection path is not a directory.${c.reset}`);
+            console.error(`  Received: ${pwd}`);
+            console.error(`  Resolved: ${resolvedPwd}`);
+            console.error("Choose a directory and run 'qmd collection add <path>' again.");
+            process.exit(1);
+          }
 
           await collectionAdd(resolvedPwd, globPattern, name);
           break;
@@ -4393,11 +4491,9 @@ if (isMain) {
     case "mcp": {
       const sub = cli.args[0]; // stop | status | undefined
 
-      // Cache dir for PID/log files — same dir as the index
-      const cacheDir = process.env.XDG_CACHE_HOME
-        ? resolve(process.env.XDG_CACHE_HOME, "qmd")
-        : resolve(homedir(), ".cache", "qmd");
-      const pidPath = resolve(cacheDir, "mcp.pid");
+      // Cache dir for PID/log files — scoped per --index so named daemons
+      // do not collide with the default index (#772).
+      const { cacheDir, pidPath, logPath } = mcpDaemonPaths();
 
       // Subcommands take priority over flags
       if (sub === "stop") {
@@ -4406,13 +4502,17 @@ if (isMain) {
           process.exit(0);
         }
         const pid = parseInt(readFileSync(pidPath, "utf-8").trim());
+        if (!isQmdMcpPid(pid)) {
+          try { unlinkSync(pidPath); } catch { /* ignore */ }
+          console.log("Cleaned up stale PID file (server was not running).");
+          process.exit(0);
+        }
         try {
-          process.kill(pid, 0); // alive?
           process.kill(pid, "SIGTERM");
           unlinkSync(pidPath);
           console.log(`Stopped QMD MCP server (PID ${pid}).`);
         } catch {
-          unlinkSync(pidPath);
+          try { unlinkSync(pidPath); } catch { /* ignore */ }
           console.log("Cleaned up stale PID file (server was not running).");
         }
         process.exit(0);
@@ -4426,20 +4526,18 @@ if (isMain) {
         const host = cli.values.host ? String(cli.values.host) : undefined;
 
         if (cli.values.daemon) {
-          // Guard: check if already running
+          // Guard: check if already running (identity-checked — recycled PIDs are stale)
           if (existsSync(pidPath)) {
             const existingPid = parseInt(readFileSync(pidPath, "utf-8").trim());
-            try {
-              process.kill(existingPid, 0); // alive?
+            if (isQmdMcpPid(existingPid)) {
               console.error(`Already running (PID ${existingPid}). Run 'qmd mcp stop' first.`);
               process.exit(1);
-            } catch {
-              // Stale PID file — continue
             }
+            // Stale or recycled PID file — remove and continue
+            try { unlinkSync(pidPath); } catch { /* ignore */ }
           }
 
           mkdirSync(cacheDir, { recursive: true });
-          const logPath = resolve(cacheDir, "mcp.log");
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
           const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
@@ -4450,6 +4548,12 @@ if (isMain) {
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
+            env: {
+              ...process.env,
+              // Explicit resolved DB path so the child does not depend on
+              // re-parsing --index (and cannot inherit a stale INDEX_PATH).
+              INDEX_PATH: getDbPath(),
+            },
           });
           child.unref();
           closeSync(logFd); // parent's copy; child inherited the fd
@@ -4464,6 +4568,16 @@ if (isMain) {
         // async cleanup handlers in startMcpHttpServer actually run.
         process.removeAllListeners("SIGTERM");
         process.removeAllListeners("SIGINT");
+        // Best-effort: if this process owns the daemon pidfile, unlink on exit
+        // (covers SIGTERM/SIGINT via startMcpHttpServer's process.exit).
+        const unlinkOwnPidfile = () => {
+          try {
+            if (!existsSync(pidPath)) return;
+            const written = parseInt(readFileSync(pidPath, "utf-8").trim());
+            if (written === process.pid) unlinkSync(pidPath);
+          } catch { /* ignore */ }
+        };
+        process.on("exit", unlinkOwnPidfile);
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
           await startMcpHttpServer(port, { dbPath: getDbPath(), host });

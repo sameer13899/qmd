@@ -474,6 +474,79 @@ describe("CLI Add Command", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Collection:");
     expect(stdout).toContain("Indexed:");
+    expect(stdout).toContain("Collection 'fixtures' created successfully");
+  });
+
+  test("rejects a nonexistent collection path without persisting it", async () => {
+    const env = await createIsolatedTestEnv("missing-collection-path");
+    const missingPath = join(fixturesDir, "does-not-exist");
+
+    const { stdout, stderr, exitCode } = await runQmd(["collection", "add", missingPath], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain("Collection path does not exist");
+    expect(stderr).toContain(`Received: ${missingPath}`);
+    expect(stderr).toContain("Resolved:");
+    expect(stderr).toContain("Provide an existing directory");
+    expect(stdout).not.toContain("created successfully");
+    expect(readFileSync(join(env.configDir, "index.yml"), "utf8")).toBe("collections: {}\n");
+
+    const listResult = await runQmd(["collection", "list"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(listResult.stdout).not.toContain("does-not-exist");
+  });
+
+  test("rejects a path containing swallowed collection flags without persisting it", async () => {
+    const env = await createIsolatedTestEnv("swallowed-collection-flags");
+    const malformedPath = `${join(fixturesDir, "missing")} --name swallowed --mask *.md`;
+    const derivedName = "missing --name swallowed --mask *.md";
+
+    const { stdout, stderr, exitCode } = await runQmd(["collection", "add", malformedPath], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain("Collection path does not exist");
+    expect(stderr).toContain(`Received: ${malformedPath}`);
+    expect(stderr).toContain("Resolved:");
+    expect(stdout).not.toContain("created successfully");
+    expect(readFileSync(join(env.configDir, "index.yml"), "utf8")).toBe("collections: {}\n");
+
+    const listResult = await runQmd(["collection", "list"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(listResult.stdout).not.toContain(derivedName);
+  });
+
+  test("rejects a regular file as a collection path without persisting it", async () => {
+    const env = await createIsolatedTestEnv("file-collection-path");
+    const filePath = join(fixturesDir, "README.md");
+
+    const { stdout, stderr, exitCode } = await runQmd(["collection", "add", filePath], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain("Collection path is not a directory");
+    expect(stderr).toContain(`Received: ${filePath}`);
+    expect(stderr).toContain("Resolved:");
+    expect(stderr).toContain("Choose a directory");
+    expect(stdout).not.toContain("created successfully");
+    expect(readFileSync(join(env.configDir, "index.yml"), "utf8")).toBe("collections: {}\n");
+
+    const listResult = await runQmd(["collection", "list"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(listResult.stdout).not.toContain("README.md");
   });
 
   test("adds files with custom glob pattern", async () => {
@@ -596,19 +669,22 @@ describe("CLI Status Command", () => {
     // blob. That sidecar matches the model-cache lookup's `includes(filename)`
     // test, so a naive scan inspects it as a GGUF and reports the model
     // "invalid" — order-dependently, whenever readdir yields the sidecar
-    // before the blob. The sidecar must be skipped.
+    // before the blob (#812). Only real `.gguf` files must be considered.
     const env = await createIsolatedTestEnv("doctor-etag-sidecar");
-    const model = "hf:example/custom-model/custom.gguf";
+    // Mirror the embeddinggemma layout from #812: bare `<name>.gguf.etag`
+    // sorts before the node-llama-cpp `hf_<org>_<name>.gguf` blob.
+    const model = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
     await writeFile(join(env.configDir, "index.yml"), `collections: {}\nmodels:\n  embed: ${model}\n  generate: ${model}\n  rerank: ${model}\n`);
     const cacheRoot = join(env.configDir, "cache");
     const modelCacheDir = join(cacheRoot, "qmd", "models");
     await mkdir(modelCacheDir, { recursive: true });
     // Create the sidecar first so readdir is more likely to surface it before
     // the blob on order-preserving filesystems (the bug's trigger condition).
-    await writeFile(join(modelCacheDir, "custom.gguf.etag"), '"a1b2c3d4e5"\n');
-    // A real blob: node-llama-cpp stores it `hf_<org>_<filename>`. Any name
-    // containing the filename works; it just needs the GGUF magic to be valid.
-    await writeFile(join(modelCacheDir, "hf_example_custom.gguf"), Buffer.concat([Buffer.from("GGUF"), Buffer.alloc(60)]));
+    await writeFile(join(modelCacheDir, "embeddinggemma-300M-Q8_0.gguf.etag"), '"9d3a1b2c3d4e5"\n');
+    await writeFile(
+      join(modelCacheDir, "hf_ggml-org_embeddinggemma-300M-Q8_0.gguf"),
+      Buffer.concat([Buffer.from("GGUF"), Buffer.alloc(60)]),
+    );
 
     const { stdout, exitCode } = await runQmd(["doctor"], {
       dbPath: env.dbPath,
@@ -918,6 +994,60 @@ describe("CLI Multi-Get Command", () => {
     for (const entry of parsed) {
       expect(entry.docid).toMatch(/^#[a-f0-9]{6}$/);
     }
+  });
+
+  test("--format files emits docid as its own CSV field (#760)", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["multi-get", "README.md", "--format", "files"],
+      { dbPath: localDbPath },
+    );
+    expect(exitCode).toBe(0);
+    const line = stdout.trim().split("\n")[0] ?? "";
+    // Shape: #docid,path[,"context"] — not "#docid path,..."
+    expect(line).toMatch(/^#[a-f0-9]{6},[^,\s]+/);
+    expect(line).not.toMatch(/^#[a-f0-9]{6} /);
+    const firstField = line.split(",")[0] ?? "";
+    expect(firstField).toMatch(/^#[a-f0-9]{6}$/);
+  });
+
+  test("retrieves a document by docid", async () => {
+    const lookup = await runQmd(["multi-get", "README.md", "--json"], { dbPath: localDbPath });
+    expect(lookup.exitCode).toBe(0);
+    const [entry] = JSON.parse(lookup.stdout);
+
+    const { stdout, stderr, exitCode } = await runQmd(["multi-get", entry.docid, "--json"], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain("No files matched pattern");
+
+    const parsed = JSON.parse(stdout);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].docid).toBe(entry.docid);
+    expect(parsed[0].body).toContain("Test Project");
+  });
+
+  test("fails for a missing single docid", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["multi-get", "#000000", "--json"], { dbPath: localDbPath });
+    expect(exitCode).toBe(1);
+    expect(stdout).toBe("");
+    expect(stderr).toContain("File not found: #000000");
+  });
+
+  test("retrieves docids in comma-separated lists", async () => {
+    const lookup = await runQmd(["multi-get", "README.md", "--json"], { dbPath: localDbPath });
+    expect(lookup.exitCode).toBe(0);
+    const [entry] = JSON.parse(lookup.stdout);
+
+    const { stdout, exitCode } = await runQmd([
+      "multi-get",
+      `${entry.docid},notes/meeting.md`,
+      "--json",
+    ], { dbPath: localDbPath });
+    expect(exitCode).toBe(0);
+
+    const parsed = JSON.parse(stdout);
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0].docid).toBe(entry.docid);
+    expect(parsed[1].file).toBe("qmd://fixtures/notes/meeting.md");
   });
 
   test("shows line numbers by default and --no-line-numbers disables them", async () => {
@@ -2320,6 +2450,141 @@ describe("mcp http daemon", () => {
     }
   }, 10000);
 
+  test("daemon HTTP server honors --index, scopes pidfile, and queries the named store (#772)", async () => {
+    const customIndex = "mcp-daemon-alt-index";
+    const customCacheDir = join(daemonTestDir, `cache-daemon-index-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const customConfigDir = join(daemonTestDir, `config-daemon-index-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    await mkdir(customCacheDir, { recursive: true });
+    await mkdir(customConfigDir, { recursive: true });
+
+    const addResult = await runQmd(
+      ["--index", customIndex, "collection", "add", fixturesDir, "--name", "mcp-fixtures"],
+      {
+        dbPath: daemonDbPath,
+        configDir: customConfigDir,
+        env: {
+          INDEX_PATH: "",
+          XDG_CACHE_HOME: customCacheDir,
+        },
+      },
+    );
+    expect(addResult.exitCode).toBe(0);
+
+    const updateResult = await runQmd(
+      ["--index", customIndex, "update"],
+      {
+        dbPath: daemonDbPath,
+        configDir: customConfigDir,
+        env: {
+          INDEX_PATH: "",
+          XDG_CACHE_HOME: customCacheDir,
+        },
+      },
+    );
+    expect(updateResult.exitCode).toBe(0);
+
+    const port = randomPort();
+    const { stdout, stderr, exitCode } = await runQmd(
+      ["--index", customIndex, "mcp", "--http", "--daemon", "--port", String(port)],
+      {
+        dbPath: daemonDbPath,
+        configDir: customConfigDir,
+        env: {
+          INDEX_PATH: "",
+          XDG_CACHE_HOME: customCacheDir,
+        },
+      },
+    );
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain("Already running");
+    expect(stdout).toContain(`http://localhost:${port}/mcp`);
+
+    const namedPidPath = join(customCacheDir, "qmd", `mcp-${customIndex}.pid`);
+    const defaultPidPath = join(customCacheDir, "qmd", "mcp.pid");
+    expect(existsSync(namedPidPath)).toBe(true);
+    expect(existsSync(defaultPidPath)).toBe(false);
+
+    const pid = parseInt(readFileSync(namedPidPath, "utf-8").trim());
+    spawnedPids.push(pid);
+
+    try {
+      const ready = await waitForServer(port);
+      expect(ready).toBe(true);
+
+      const res = await fetch(`http://localhost:${port}/query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ searches: [{ type: "lex", query: "authentication" }], limit: 5, rerank: false }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      const files = body.results.map((r: { file: string }) => r.file);
+      expect(files.some((file: string) => file.includes("mcp-fixtures/notes/meeting.md"))).toBe(true);
+
+      const { stdout: stopOut, exitCode: stopCode } = await runQmd(
+        ["--index", customIndex, "mcp", "stop"],
+        {
+          dbPath: daemonDbPath,
+          configDir: customConfigDir,
+          env: {
+            INDEX_PATH: "",
+            XDG_CACHE_HOME: customCacheDir,
+          },
+        },
+      );
+      expect(stopCode).toBe(0);
+      expect(stopOut).toContain("Stopped");
+      expect(existsSync(namedPidPath)).toBe(false);
+    } finally {
+      try { process.kill(pid, "SIGTERM"); } catch { /* already stopped */ }
+      await sleep(300);
+      try { unlinkSync(namedPidPath); } catch {}
+    }
+  }, 15000);
+
+  test("named-index daemon does not collide with the default daemon pidfile (#772)", async () => {
+    const portDefault = randomPort();
+    const portNamed = randomPort();
+    const namedIndex = "other-index";
+
+    const { exitCode: defaultCode } = await runDaemonQmd([
+      "mcp", "--http", "--daemon", "--port", String(portDefault),
+    ]);
+    expect(defaultCode).toBe(0);
+    expect(existsSync(pidPath())).toBe(true);
+    const defaultPid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+    spawnedPids.push(defaultPid);
+
+    const { stdout, stderr, exitCode: namedCode } = await runDaemonQmd([
+      "--index", namedIndex, "mcp", "--http", "--daemon", "--port", String(portNamed),
+    ]);
+    const namedPidPath = join(daemonCacheDir, "qmd", `mcp-${namedIndex}.pid`);
+    try {
+      expect(namedCode).toBe(0);
+      expect(stderr).not.toContain("Already running");
+      expect(stdout).toContain(`http://localhost:${portNamed}/mcp`);
+      expect(existsSync(namedPidPath)).toBe(true);
+
+      const namedPid = parseInt(readFileSync(namedPidPath, "utf-8").trim());
+      spawnedPids.push(namedPid);
+      expect(namedPid).not.toBe(defaultPid);
+
+      expect(await waitForServer(portDefault)).toBe(true);
+      expect(await waitForServer(portNamed)).toBe(true);
+    } finally {
+      try { process.kill(defaultPid, "SIGTERM"); } catch {}
+      try {
+        if (existsSync(namedPidPath)) {
+          const namedPid = parseInt(readFileSync(namedPidPath, "utf-8").trim());
+          try { process.kill(namedPid, "SIGTERM"); } catch {}
+        }
+      } catch {}
+      await sleep(500);
+      try { unlinkSync(pidPath()); } catch {}
+      try { unlinkSync(namedPidPath); } catch {}
+    }
+  });
+
   // -------------------------------------------------------------------------
   // Daemon lifecycle
   // -------------------------------------------------------------------------
@@ -2433,6 +2698,60 @@ describe("mcp http daemon", () => {
     process.kill(pid, "SIGTERM");
     await sleep(500);
     try { unlinkSync(pidPath()); } catch {}
+  });
+
+  test("stop does not SIGTERM a live non-qmd PID from a recycled pidfile (#806)", async () => {
+    // Stand-in for a recycled PID owner (must not be killed)
+    const decoy = spawn("sleep", ["1000000"], { stdio: "ignore" });
+    expect(decoy.pid).toBeTruthy();
+    spawnedPids.push(decoy.pid!);
+    writeFileSync(pidPath(), String(decoy.pid));
+
+    try {
+      const { stdout, exitCode } = await runDaemonQmd(["mcp", "stop"]);
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain("stale");
+      expect(existsSync(pidPath())).toBe(false);
+
+      // Decoy must still be alive
+      expect(() => process.kill(decoy.pid!, 0)).not.toThrow();
+    } finally {
+      decoy.kill("SIGTERM");
+      await new Promise<void>((resolve) => decoy.once("close", () => resolve()));
+    }
+  });
+
+  test("--daemon treats live non-qmd pidfile PID as stale and starts (#806)", async () => {
+    const decoy = spawn("sleep", ["1000000"], { stdio: "ignore" });
+    expect(decoy.pid).toBeTruthy();
+    spawnedPids.push(decoy.pid!);
+    writeFileSync(pidPath(), String(decoy.pid));
+
+    const port = randomPort();
+    try {
+      const { stdout, stderr, exitCode } = await runDaemonQmd([
+        "mcp", "--http", "--daemon", "--port", String(port),
+      ]);
+      expect(exitCode).toBe(0);
+      expect(stderr).not.toContain("Already running");
+      expect(stdout).toContain(`http://localhost:${port}/mcp`);
+
+      const pid = parseInt(readFileSync(pidPath(), "utf-8").trim());
+      spawnedPids.push(pid);
+      expect(pid).not.toBe(decoy.pid);
+
+      // Decoy must still be alive
+      expect(() => process.kill(decoy.pid!, 0)).not.toThrow();
+
+      const ready = await waitForServer(port);
+      expect(ready).toBe(true);
+      process.kill(pid, "SIGTERM");
+      await sleep(500);
+      try { unlinkSync(pidPath()); } catch {}
+    } finally {
+      decoy.kill("SIGTERM");
+      await new Promise<void>((resolve) => decoy.once("close", () => resolve()));
+    }
   });
 });
 

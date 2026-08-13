@@ -17,6 +17,7 @@ import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
+  DEFAULT_RERANK_MODEL,
   verifySqliteVecLoaded,
   getDefaultDbPath,
   homedir,
@@ -326,6 +327,15 @@ describe("Store Creation", () => {
     expect(tableNames).toContain("llm_cache");
     // Note: path_contexts table removed in favor of YAML-based context storage
 
+    // The status-scan covering index ships with the schema — without it every
+    // getHashesNeedingEmbedding() pays a full content_vectors scan through a
+    // transient automatic index.
+    const indexes = store.db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type='index' AND tbl_name='content_vectors'
+    `).all() as { name: string }[];
+    expect(indexes.map(i => i.name)).toContain("idx_content_vectors_model_fingerprint");
+
     await cleanupTestDb(store);
   });
 
@@ -368,8 +378,15 @@ describe("Store Creation", () => {
     legacyDb.close();
 
     const store = createStore(dbPath);
+    const indexNames = () => (store.db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type='index' AND tbl_name='content_vectors'
+    `).all() as { name: string }[]).map(i => i.name);
     let columns = store.db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
     expect(columns.map(col => col.name)).not.toContain("embed_fingerprint");
+    // The status-scan index needs the modern columns, so it must stay deferred
+    // alongside the column migration itself.
+    expect(indexNames()).not.toContain("idx_content_vectors_model_fingerprint");
 
     expect(store.getHashesNeedingEmbedding(model)).toBe(1);
 
@@ -377,6 +394,8 @@ describe("Store Creation", () => {
     const migratedRow = store.db.prepare(`SELECT embed_fingerprint FROM content_vectors WHERE hash = ?`).get("hash1") as { embed_fingerprint: string };
     expect(columns.map(col => col.name)).toContain("embed_fingerprint");
     expect(migratedRow.embed_fingerprint).toBe("");
+    // The lazy column repair recreates the deferred status-scan index.
+    expect(indexNames()).toContain("idx_content_vectors_model_fingerprint");
 
     await cleanupTestDb(store);
   });
@@ -1131,6 +1150,17 @@ describe("Caching", () => {
     expect(key1).not.toBe(key2);
   });
 
+  test("rerank cache keys differ when the rerank model differs (#764)", () => {
+    const query = "same query";
+    const chunk = "same chunk";
+    const keyA = getCacheKey("rerank", { query, model: "hf:example/rerank-a/a.gguf", chunk });
+    const keyB = getCacheKey("rerank", { query, model: "hf:example/rerank-b/b.gguf", chunk });
+    const keyNoModel = getCacheKey("rerank", { query, chunk });
+    expect(keyA).not.toBe(keyB);
+    expect(keyA).not.toBe(keyNoModel);
+    expect(keyB).not.toBe(keyNoModel);
+  });
+
   test("store cache operations work correctly", async () => {
     const store = await createTestStore();
 
@@ -1151,6 +1181,91 @@ describe("Caching", () => {
     expect(store.getCachedResult(key)).toBeNull();
 
     await cleanupTestDb(store);
+  });
+
+  test("rerank cache key includes the resolved rerank model (#764)", async () => {
+    const store = await createTestStore();
+    const query = "rerank cache model swap";
+    const chunk = "identical chunk text";
+    const docs = [{ file: "doc.md", text: chunk }];
+
+    const makeMock = (modelName: string, score: number) => {
+      const rerankSpy = vi.fn(async (_query: string, scoredDocs: { file: string; text: string }[]) => ({
+        results: scoredDocs.map((doc, index) => ({ file: doc.file, score, index })),
+        model: modelName,
+      }));
+      return {
+        spy: rerankSpy,
+        llm: { rerank: rerankSpy, rerankModelName: modelName },
+      };
+    };
+
+    const modelA = "hf:example/rerank-a/a.gguf";
+    const modelB = "hf:example/rerank-b/b.gguf";
+    const mockA = makeMock(modelA, 0.11);
+    const llmSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(mockA.llm as any);
+
+    try {
+      const first = await store.rerank(query, docs);
+      expect(first[0]!.score).toBe(0.11);
+      expect(mockA.spy).toHaveBeenCalledTimes(1);
+
+      const keyA = getCacheKey("rerank", { query, model: modelA, chunk });
+      const keyB = getCacheKey("rerank", { query, model: modelB, chunk });
+      const keyDefault = getCacheKey("rerank", { query, model: DEFAULT_RERANK_MODEL, chunk });
+      const keyNoModel = getCacheKey("rerank", { query, chunk });
+
+      expect(store.getCachedResult(keyA)).toBe("0.11");
+      expect(store.getCachedResult(keyNoModel)).toBeNull();
+      expect(store.getCachedResult(keyDefault)).toBeNull();
+
+      const mockB = makeMock(modelB, 0.99);
+      llmSpy.mockReturnValue(mockB.llm as any);
+
+      const second = await store.rerank(query, docs);
+      expect(mockB.spy).toHaveBeenCalledTimes(1);
+      expect(second[0]!.score).toBe(0.99);
+      expect(store.getCachedResult(keyB)).toBe("0.99");
+
+      const third = await store.rerank(query, docs);
+      expect(mockB.spy).toHaveBeenCalledTimes(1);
+      expect(third[0]!.score).toBe(0.99);
+    } finally {
+      llmSpy.mockRestore();
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("rerank cache key follows store.llm.rerankModelName (#764)", async () => {
+    const store = await createTestStore();
+    const query = "store.llm model swap";
+    const docs = [{ file: "doc.md", text: "chunk" }];
+
+    const makeMock = (modelName: string, score: number) => {
+      const rerankSpy = vi.fn(async (_query: string, scoredDocs: { file: string; text: string }[]) => ({
+        results: scoredDocs.map((doc, index) => ({ file: doc.file, score, index })),
+        model: modelName,
+      }));
+      return { spy: rerankSpy, llm: { rerank: rerankSpy, rerankModelName: modelName } };
+    };
+
+    const mockA = makeMock("hf:example/store-llm-a/a.gguf", 0.21);
+    const mockB = makeMock("hf:example/store-llm-b/b.gguf", 0.87);
+    store.llm = mockA.llm as any;
+
+    try {
+      const first = await store.rerank(query, docs);
+      expect(first[0]!.score).toBe(0.21);
+      expect(mockA.spy).toHaveBeenCalledTimes(1);
+
+      store.llm = mockB.llm as any;
+      const second = await store.rerank(query, docs);
+      expect(second[0]!.score).toBe(0.87);
+      expect(mockB.spy).toHaveBeenCalledTimes(1);
+      expect(mockA.spy).toHaveBeenCalledTimes(1);
+    } finally {
+      await cleanupTestDb(store);
+    }
   });
 });
 
@@ -1965,6 +2080,59 @@ describe("Document Retrieval", () => {
       const { docs, errors } = store.findDocuments("doc1.md, doc2.md");
       expect(errors).toHaveLength(0);
       expect(docs).toHaveLength(2);
+
+      await cleanupTestDb(store);
+    });
+
+    test("findDocuments finds by docid", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection();
+
+      await insertTestDocument(store.db, collectionName, {
+        name: "docid-doc",
+        filepath: "/path/docid-doc.md",
+        displayPath: "docid-doc.md",
+        body: "# Docid Doc\n\nThe content",
+      });
+
+      const doc = store.findDocument("docid-doc.md");
+      expect("error" in doc).toBe(false);
+      if (!("error" in doc)) {
+        const { docs, errors } = store.findDocuments(`#${doc.docid}`);
+        expect(errors).toHaveLength(0);
+        expect(docs).toHaveLength(1);
+        expect(docs[0]!.doc.docid).toBe(doc.docid);
+      }
+
+      await cleanupTestDb(store);
+    });
+
+    test("findDocuments finds docids in a comma-separated list", async () => {
+      const store = await createTestStore();
+      const collectionName = await createTestCollection();
+
+      await insertTestDocument(store.db, collectionName, {
+        name: "doc1",
+        filepath: "/path/doc1.md",
+        displayPath: "doc1.md",
+      });
+      await insertTestDocument(store.db, collectionName, {
+        name: "doc2",
+        filepath: "/path/doc2.md",
+        displayPath: "doc2.md",
+      });
+
+      const doc1 = store.findDocument("doc1.md");
+      expect("error" in doc1).toBe(false);
+      if (!("error" in doc1)) {
+        const { docs, errors } = store.findDocuments(`#${doc1.docid}, doc2.md`);
+        expect(errors).toHaveLength(0);
+        expect(docs).toHaveLength(2);
+        expect(docs.map((result) => result.doc.displayPath)).toEqual([
+          `${collectionName}/doc1.md`,
+          `${collectionName}/doc2.md`,
+        ]);
+      }
 
       await cleanupTestDb(store);
     });
@@ -2870,6 +3038,83 @@ describe("Integration", () => {
 });
 
 // =============================================================================
+// Vector Search collection filter (no LLM — uses precomputed embeddings)
+// =============================================================================
+
+describe("Vector Search collection filter", () => {
+  test("searchVec finds docs in a small collection crowded by a large one (#791, #803)", async () => {
+    const store = await createTestStore();
+    const large = await createTestCollection({ name: "large", pwd: "/test/large" });
+    const small = await createTestCollection({ name: "small", pwd: "/test/small" });
+
+    const dims = 8;
+    store.ensureVecTable(dims);
+    const now = new Date().toISOString();
+    const queryEmbedding = Array(dims).fill(0);
+    queryEmbedding[0] = 1;
+
+    // 250 nearer neighbours in the large collection. With limit=3:
+    //   - old global k=limit*3=9 never sees `small`
+    //   - a plain multiplier (limit*30=90) still misses it
+    //   - sqlite-vec also caps k at 4096, so multipliers cannot fix tiny
+    //     collections in huge indexes. Collection-scoped exact scan does.
+    for (let i = 0; i < 250; i++) {
+      const hash = `largehash${String(i).padStart(3, "0")}`;
+      await insertTestDocument(store.db, large, {
+        name: `noise-${i}`,
+        hash,
+        body: `Noise document ${i}`,
+        displayPath: `noise-${i}.md`,
+      });
+      const embedding = new Float32Array(dims);
+      embedding[0] = 1;
+      store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, now);
+      store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, embedding);
+    }
+
+    const targetHash = "smallhash001";
+    await insertTestDocument(store.db, small, {
+      name: "target",
+      hash: targetHash,
+      body: "Target document in the small collection",
+      displayPath: "target.md",
+    });
+    // Farther than the noise vectors — only found via collection-scoped scan.
+    const targetEmbedding = new Float32Array(dims);
+    targetEmbedding[0] = 0.6;
+    targetEmbedding[1] = 0.8;
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(targetHash, now);
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${targetHash}_0`, targetEmbedding);
+
+    const filtered = await store.searchVec(
+      "ignored — embedding precomputed",
+      "test-model",
+      3,
+      small,
+      undefined,
+      queryEmbedding,
+    );
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0]!.collectionName).toBe(small);
+    expect(filtered[0]!.displayPath).toBe(`${small}/target.md`);
+
+    // Unfiltered search still ranks the closer large-collection docs first.
+    const unfiltered = await store.searchVec(
+      "ignored — embedding precomputed",
+      "test-model",
+      3,
+      undefined,
+      undefined,
+      queryEmbedding,
+    );
+    expect(unfiltered).toHaveLength(3);
+    expect(unfiltered.every((r) => r.collectionName === large)).toBe(true);
+
+    await cleanupTestDb(store);
+  });
+});
+
+// =============================================================================
 // LlamaCpp Integration Tests (using real local models)
 // =============================================================================
 
@@ -3088,6 +3333,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       await cleanupTestDb(store);
     }
   });
+
 });
 
 // =============================================================================
