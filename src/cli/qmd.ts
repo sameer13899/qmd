@@ -12,6 +12,7 @@ import { createInterface } from "readline/promises";
 import {
   getPwd,
   getRealPath,
+  isPathInsideDir,
   homedir,
   resolve,
   enableProductionMode,
@@ -24,7 +25,7 @@ import {
   renameCollection,
   findSimilarFiles,
   findDocument,
-  findDocumentByDocid,
+  resolveCommaListName,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
   clearAllEmbeddings,
@@ -55,13 +56,13 @@ import {
   deactivateDocument,
   getActiveDocumentPaths,
   cleanupOrphanedContent,
-  deleteLLMCache,
-  deleteInactiveDocuments,
-  cleanupOrphanedVectors,
-  vacuumDatabase,
+  countOrphanedVectors,
+  previewCleanup,
+  runCleanup,
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
   handelize,
+  escapeLikePattern,
   hybridQuery,
   vectorSearchQuery,
   structuredSearch,
@@ -74,6 +75,7 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_GLOB,
+  splitGlobMask,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
@@ -114,6 +116,22 @@ import {
   type CollectionConfig,
   type ModelsConfig,
 } from "../collections.js";
+import {
+  decideLocalConfigGate,
+  gatedItems,
+  hasGatedItems,
+  isCollectionPathInsideProject,
+  isLocalConfigPath,
+  isLocalConfigTrustOptedIn,
+  isTrusted,
+  listTrusted,
+  recordTrust,
+  revokeTrust,
+  sensitiveDigest,
+  type BuiltinModels,
+  type GatedItems,
+  type SensitiveSnapshot,
+} from "../trust.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
 // Importing this module for its exports (e.g. buildEditorUri, termLink from
@@ -138,10 +156,13 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
+      // Untrusted project-local custom model URIs must not be loaded; status
+      // still displays the YAML values via resolveModelsForCli (#889).
+      const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
       const llm = new LlamaCpp({
-        embedModel: activeModels.embed,
-        generateModel: activeModels.generate,
-        rerankModel: activeModels.rerank,
+        embedModel: modelsForLlm.embed,
+        generateModel: modelsForLlm.generate,
+        rerankModel: modelsForLlm.rerank,
       });
       setDefaultLlamaCpp(llm);
       store.llm = llm;
@@ -482,6 +503,14 @@ function sanitizeDiagnosticMessage(message: string): string {
     .join("; ");
 }
 
+/** Hint after `qmd update` when orphaned embedding chunks exceed this share of vectors (#768). */
+const ORPHAN_VECTOR_HINT_RATIO = 0.1;
+
+function formatOrphanedVectorHint(orphaned: number, total: number): string {
+  const pct = total > 0 ? Math.round((orphaned / total) * 100) : 0;
+  return `${orphaned} orphaned embedding chunks (${pct}% of vectors) — run 'qmd cleanup' to reclaim space`;
+}
+
 async function showStatus(): Promise<void> {
   const dbPath = getDbPath();
   const db = getDb();
@@ -525,9 +554,15 @@ async function showStatus(): Promise<void> {
   }
   console.log("");
 
+  const orphanedVectors = countOrphanedVectors(db);
+
   console.log(`${c.bold}Documents${c.reset}`);
   console.log(`  Total:    ${totalDocs.count} files indexed`);
   console.log(`  Vectors:  ${vectorCount.count} embedded`);
+  if (orphanedVectors > 0) {
+    const pct = vectorCount.count > 0 ? Math.round((orphanedVectors / vectorCount.count) * 100) : 0;
+    console.log(`  ${c.yellow}Orphaned: ${orphanedVectors} embedding chunks (${pct}%)${c.reset} — run 'qmd cleanup'`);
+  }
   if (needsEmbedding > 0) {
     console.log(`  ${c.yellow}Pending:  ${needsEmbedding} need embedding${c.reset} (run 'qmd embed')`);
   }
@@ -671,7 +706,196 @@ async function showStatus(): Promise<void> {
   closeDb();
 }
 
+function builtinModels(): BuiltinModels {
+  return {
+    embed: DEFAULT_EMBED_MODEL,
+    rerank: DEFAULT_RERANK_MODEL,
+    generate: DEFAULT_QUERY_MODEL,
+  };
+}
+
+/**
+ * Gated surface of the active YAML: hooks, collection paths, models.
+ * Read from the YAML rather than the synced SQLite copy so `qmd trust`
+ * and `qmd update` always digest the same set.
+ */
+function collectSensitiveSnapshot(): SensitiveSnapshot {
+  const config = loadConfig();
+  return {
+    hooks: Object.entries(config.collections ?? {})
+      .filter(([, col]) => !!col.update)
+      .map(([name, col]) => ({ collection: name, command: col.update! })),
+    paths: Object.entries(config.collections ?? {}).map(([name, col]) => ({
+      collection: name,
+      path: col.path,
+    })),
+    models: {
+      embed: config.models?.embed,
+      rerank: config.models?.rerank,
+      generate: config.models?.generate,
+    },
+  };
+}
+
+function localConfigDigest(configPath: string, snapshot: SensitiveSnapshot): string {
+  return sensitiveDigest(snapshot, configPath, builtinModels());
+}
+
+function localConfigGated(configPath: string, snapshot: SensitiveSnapshot): GatedItems {
+  return gatedItems(configPath, snapshot, builtinModels());
+}
+
+/** True when this process may use the local config's gated fields. */
+function localConfigIsFullyTrusted(): boolean {
+  const configPath = getConfigPath();
+  if (!isLocalConfigPath(configPath)) return true;
+  if (isLocalConfigTrustOptedIn()) return true;
+  const snapshot = collectSensitiveSnapshot();
+  const gated = localConfigGated(configPath, snapshot);
+  if (!hasGatedItems(gated)) return true;
+  return isTrusted(configPath, localConfigDigest(configPath, snapshot));
+}
+
+/** Record the active config's current gated set as approved. */
+function trustCurrentConfig(): void {
+  const configPath = getConfigPath();
+  if (!isLocalConfigPath(configPath)) return;
+  recordTrust(configPath, localConfigDigest(configPath, collectSensitiveSnapshot()));
+}
+
+/** Ask the user a yes/no question. Only called when stdin and stdout are TTYs. */
+async function confirmOnTty(question: string): Promise<boolean> {
+  const { createInterface } = await import("node:readline/promises");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question(question)).trim().toLowerCase();
+    return answer === "y" || answer === "yes";
+  } finally {
+    rl.close();
+  }
+}
+
+function printGatedItems(gated: GatedItems): void {
+  if (gated.hooks.length > 0) {
+    console.log(`${c.yellow}This project's config defines update commands:${c.reset}`);
+    for (const hook of gated.hooks) {
+      console.log(`  ${c.bold}${hook.collection}${c.reset}: ${hook.command}`);
+    }
+  }
+  if (gated.paths.length > 0) {
+    console.log(`${c.yellow}Collection paths outside this project:${c.reset}`);
+    for (const item of gated.paths) {
+      console.log(`  ${c.bold}${item.collection}${c.reset}: ${item.path}`);
+    }
+  }
+  if (gated.models.length > 0) {
+    console.log(`${c.yellow}Custom models:${c.reset}`);
+    for (const item of gated.models) {
+      console.log(`  ${c.bold}${item.slot}${c.reset}: ${item.uri}`);
+    }
+  }
+}
+
+/**
+ * Decide whether this run may use gated fields from a project-local config
+ * (update hooks, out-of-project collection paths, custom model URIs).
+ * Returns false when those must be skipped — in-project indexing still
+ * proceeds, since that is what the caller asked for.
+ */
+async function resolveLocalConfigTrust(): Promise<boolean> {
+  const configPath = getConfigPath();
+  const snapshot = collectSensitiveSnapshot();
+  const gated = localConfigGated(configPath, snapshot);
+  if (!hasGatedItems(gated)) return true;
+
+  const decision = decideLocalConfigGate({
+    configPath,
+    snapshot,
+    builtins: builtinModels(),
+    isInteractive: !!process.stdin.isTTY && !!process.stdout.isTTY,
+  });
+
+  if (decision.action === "run") return true;
+
+  printGatedItems(gated);
+  console.log(`${c.dim}Config that came with a checkout is not trusted by default.${c.reset}`);
+
+  if (decision.action === "skip") {
+    console.log(`${c.yellow}Skipping them — no terminal to confirm on. Indexing of this project continues.${c.reset}`);
+    console.log(`${c.dim}Approve with 'qmd trust', or set QMD_TRUST_LOCAL_CONFIG=1 for unattended runs.${c.reset}\n`);
+    return false;
+  }
+
+  const approved = await confirmOnTty("Trust this project's .qmd config? [y/N] ");
+  if (!approved) {
+    console.log(`${c.yellow}Skipped. Indexing of this project continues.${c.reset}\n`);
+    return false;
+  }
+  recordTrust(configPath, decision.digest);
+  console.log(`${c.green}Trusted ${configPath}.${c.reset} ${c.dim}Editing a hook, path, or model will ask again.${c.reset}\n`);
+  return true;
+}
+
+/**
+ * `qmd trust [list|revoke]` — approve, inspect or drop the approval for
+ * the project-local config in scope (hooks, out-of-project paths, custom models).
+ */
+function manageTrust(subcommand?: string): void {
+  const configPath = getConfigPath();
+
+  if (subcommand === "list") {
+    const records = listTrusted();
+    if (records.length === 0) {
+      console.log(`${c.dim}No trusted project configs.${c.reset}`);
+      return;
+    }
+    for (const record of records) {
+      console.log(`${record.path} ${c.dim}(trusted ${record.trustedAt})${c.reset}`);
+    }
+    return;
+  }
+
+  if (subcommand === "revoke") {
+    if (!isLocalConfigPath(configPath)) {
+      console.log(`${c.dim}No project-local .qmd config in scope — ${configPath} is your own config and is never gated.${c.reset}`);
+      console.log(`${c.dim}Run this from inside the project, or see 'qmd trust list'.${c.reset}`);
+      return;
+    }
+    if (revokeTrust(configPath)) {
+      console.log(`${c.green}✓ Revoked trust for ${configPath}${c.reset}`);
+    } else {
+      console.log(`${c.dim}${configPath} was not trusted.${c.reset}`);
+    }
+    return;
+  }
+
+  if (subcommand) {
+    console.error(`Usage: qmd trust [list|revoke]`);
+    process.exit(1);
+  }
+
+  if (!isLocalConfigPath(configPath)) {
+    console.log(`${c.dim}${configPath} is your own config — it is never gated. Nothing to trust.${c.reset}`);
+    return;
+  }
+
+  const snapshot = collectSensitiveSnapshot();
+  const gated = localConfigGated(configPath, snapshot);
+  if (!hasGatedItems(gated)) {
+    console.log(`${c.dim}${configPath} defines no update commands, out-of-project collection paths, or custom models. Nothing to trust.${c.reset}`);
+    return;
+  }
+
+  printGatedItems(gated);
+  recordTrust(configPath, localConfigDigest(configPath, snapshot));
+  console.log(`${c.green}✓ Trusted ${configPath}${c.reset}`);
+  console.log(`${c.dim}Editing a hook, out-of-project path, or custom model will ask again. Revoke with 'qmd trust revoke'.${c.reset}`);
+}
+
 async function updateCollections(): Promise<void> {
+  // Prompt before opening the store so an approval is visible to getStore (#889).
+  const allowed = await resolveLocalConfigTrust();
+
   const db = getDb();
   const storeInstance = getStore();
   // Collections are defined in YAML; no duplicate cleanup needed.
@@ -687,6 +911,12 @@ async function updateCollections(): Promise<void> {
     return;
   }
 
+  // A project-local .qmd/index.yml travels with a `git clone`, so its `update:`
+  // hooks, out-of-project collection paths, and custom model URIs are somebody
+  // else's choices until the user says otherwise (#886, #889).
+  const hooksAllowed = allowed;
+  const configPath = getConfigPath();
+
   console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
 
   for (let i = 0; i < collections.length; i++) {
@@ -696,7 +926,13 @@ async function updateCollections(): Promise<void> {
 
     // Execute custom update command if specified in YAML
     const yamlCol = getCollectionFromYaml(col.name);
-    if (yamlCol?.update) {
+    const rawPath = yamlCol?.path ?? col.pwd;
+    if (!hooksAllowed && isLocalConfigPath(configPath) && !isCollectionPathInsideProject(configPath, rawPath)) {
+      console.log(`${c.yellow}Skipping collection '${col.name}' — path ${rawPath} is outside this project and this .qmd config is not trusted.${c.reset}`);
+      console.log(`${c.dim}Approve with 'qmd trust'.${c.reset}\n`);
+      continue;
+    }
+    if (yamlCol?.update && hooksAllowed) {
       console.log(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
       try {
         const proc = nodeSpawn("bash", ["-c", yamlCol.update], {
@@ -748,6 +984,7 @@ async function updateCollections(): Promise<void> {
 
     progress.clear();
     console.log(`\nIndexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
+    reportSkippedReads(result.skippedFiles);
     if (result.orphanedCleaned > 0) {
       console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
     }
@@ -756,11 +993,16 @@ async function updateCollections(): Promise<void> {
 
   // Check if any documents need embedding (show once at end)
   const needsEmbedding = getHashesNeedingEmbedding(db);
+  const vectorTotal = (db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number }).count;
+  const orphanedVectors = countOrphanedVectors(db);
   closeDb();
 
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+  }
+  if (vectorTotal > 0 && orphanedVectors / vectorTotal >= ORPHAN_VECTOR_HINT_RATIO) {
+    console.log(`\n${formatOrphanedVectorHint(orphanedVectors, vectorTotal)}`);
   }
 }
 
@@ -1120,66 +1362,17 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
       : [pattern.trim()].filter(Boolean);
     files = [];
     for (const name of names) {
-      let doc: { virtual_path: string; body_length: number; collection: string; path: string } | null = null;
-      const docidMatch = isDocid(name) ? findDocumentByDocid(db, name) : null;
-      const lookupName = docidMatch?.filepath ?? name;
-
-      // Handle virtual paths
-      if (isVirtualPath(lookupName)) {
-        const parsed = parseVirtualPath(lookupName);
-        if (parsed) {
-          // Try exact match on collection + path
-          doc = db.prepare(`
-            SELECT
-              'qmd://' || d.collection || '/' || d.path as virtual_path,
-              LENGTH(content.doc) as body_length,
-              d.collection,
-              d.path
-            FROM documents d
-            JOIN content ON content.hash = d.hash
-            WHERE d.collection = ? AND d.path = ? AND d.active = 1
-          `).get(parsed.collectionName, parsed.path) as typeof doc;
-        }
-      } else if (!docidMatch) {
-        // Try exact match on path
-        doc = db.prepare(`
-          SELECT
-            'qmd://' || d.collection || '/' || d.path as virtual_path,
-            LENGTH(content.doc) as body_length,
-            d.collection,
-            d.path
-          FROM documents d
-          JOIN content ON content.hash = d.hash
-          WHERE d.path = ? AND d.active = 1
-          LIMIT 1
-        `).get(lookupName) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
-
-        // Try suffix match
-        if (!doc) {
-          doc = db.prepare(`
-            SELECT
-              'qmd://' || d.collection || '/' || d.path as virtual_path,
-              LENGTH(content.doc) as body_length,
-              d.collection,
-              d.path
-            FROM documents d
-            JOIN content ON content.hash = d.hash
-            WHERE d.path LIKE ? AND d.active = 1
-            LIMIT 1
-          `).get(`%${lookupName}`) as { virtual_path: string; body_length: number; collection: string; path: string } | null;
-        }
-      }
-
-      if (doc) {
+      const resolved = resolveCommaListName(db, name);
+      if (resolved.ok) {
         files.push({
-          filepath: doc.virtual_path,
-          displayPath: doc.virtual_path,
-          bodyLength: doc.body_length,
-          collection: doc.collection,
-          path: doc.path
+          filepath: resolved.match.virtualPath,
+          displayPath: resolved.match.virtualPath,
+          bodyLength: resolved.match.bodyLength,
+          collection: resolved.match.collection,
+          path: resolved.match.path
         });
       } else {
-        console.error(`File not found: ${name}`);
+        console.error(resolved.error);
       }
     }
     if (isSingleDocid && files.length === 0) {
@@ -1513,10 +1706,10 @@ function listFiles(pathArg?: string): void {
       SELECT d.path, d.title, d.modified_at, LENGTH(ct.doc) as size
       FROM documents d
       JOIN content ct ON d.hash = ct.hash
-      WHERE d.collection = ? AND d.path LIKE ? AND d.active = 1
+      WHERE d.collection = ? AND d.path LIKE ? ESCAPE '#' AND d.active = 1
       ORDER BY d.path
     `;
-    params = [coll.name, `${pathPrefix}%`];
+    params = [coll.name, `${escapeLikePattern(pathPrefix)}%`];
   } else {
     // List all files in the collection
     query = `
@@ -1612,6 +1805,13 @@ function collectionList(): void {
   closeDb();
 }
 
+/** Canonical --mask, with --glob as the alias OpenClaw and others already pass (#536). */
+function collectionGlobFromCli(values: { mask?: unknown; glob?: unknown }): string {
+  const mask = typeof values.mask === "string" && values.mask.length > 0 ? values.mask : undefined;
+  const glob = typeof values.glob === "string" && values.glob.length > 0 ? values.glob : undefined;
+  return mask ?? glob ?? DEFAULT_GLOB;
+}
+
 async function collectionAdd(pwd: string, globPattern: string, name?: string): Promise<void> {
   // If name not provided, generate from pwd basename
   let collName = name;
@@ -1643,6 +1843,8 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
   // Add to YAML config + sync to SQLite
   const { addCollection } = await import("../collections.js");
   addCollection(collName, pwd, globPattern);
+  // The user just typed this path, so it needs no separate approval (#889).
+  trustCurrentConfig();
   resyncConfig();
 
   // Create the collection and index files
@@ -1722,7 +1924,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     ...excludeDirs.map(d => `**/${d}/**`),
     ...(ignorePatterns || []),
   ];
-  const allFiles: string[] = await fastGlob(globPattern, {
+  const allFiles: string[] = await fastGlob(splitGlobMask(globPattern), {
     cwd: resolvedPwd,
     onlyFiles: true,
     followSymbolicLinks: false,
@@ -1744,21 +1946,32 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   }
 
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
+  const skippedFiles: { file: string; code: string }[] = [];
   const seenPaths = new Set<string>();
+  // Literal paths of every file in this scan. Passed to the legacy-path
+  // migration so it never adopts a row that still belongs to a live file.
+  const livePaths = new Set(files.map(f => f.replace(/\\/g, '/')));
   const startTime = Date.now();
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
     // Store the literal relative path — handelize() is NOT applied at index time.
     const path = relativeFile.replace(/\\/g, '/');
+    if (!isPathInsideDir(resolvedPwd, filepath)) {
+      processed++;
+      skippedFiles.push({ file: relativeFile, code: "OUTSIDE_COLLECTION" });
+      progress.set((processed / total) * 100);
+      continue;
+    }
     seenPaths.add(path);
 
     let content: string;
     try {
       content = readFileSync(filepath, "utf-8");
-    } catch {
-      // Skip files that can't be read (e.g. iCloud evicted files returning EAGAIN)
+    } catch (err) {
+      // Skip files that can't be read (ETIMEDOUT, EAGAIN, EACCES, …) (#460)
       processed++;
+      skippedFiles.push({ file: relativeFile, code: fsErrorCode(err) });
       progress.set((processed / total) * 100);
       continue;
     }
@@ -1773,7 +1986,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const title = extractTitle(content, relativeFile);
 
     // Check if document exists (also migrates legacy lowercase paths)
-    const existing = findOrMigrateLegacyDocument(db, collectionName, path);
+    const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
 
     if (existing) {
       if (existing.hash === hash) {
@@ -1829,6 +2042,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
+  reportSkippedReads(skippedFiles);
   if (orphanedContent > 0) {
     console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
   }
@@ -1838,6 +2052,29 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   }
 
   closeDb();
+}
+
+function fsErrorCode(err: unknown): string {
+  if (err && typeof err === "object" && "code" in err) {
+    const code = (err as { code: unknown }).code;
+    if (typeof code === "string" && code.length > 0) return code;
+  }
+  return "ERROR";
+}
+
+function reportSkippedReads(skippedFiles: { file: string; code: string }[]): void {
+  if (skippedFiles.length === 0) return;
+  for (const skipped of skippedFiles) {
+    if (skipped.code === "OUTSIDE_COLLECTION") {
+      console.warn(`⚠ Skipped file outside collection: ${skipped.file}`);
+    } else {
+      console.warn(`⚠ Skipped unreadable file: ${skipped.file} (${skipped.code})`);
+    }
+  }
+  const escaped = skippedFiles.filter(f => f.code === "OUTSIDE_COLLECTION").length;
+  const unreadable = skippedFiles.length - escaped;
+  if (escaped) console.warn(`Skipped ${escaped} file(s) outside the collection root`);
+  if (unreadable) console.warn(`Skipped ${unreadable} unreadable file(s)`);
 }
 
 function renderProgressBar(percent: number, width: number = 30): string {
@@ -1910,6 +2147,14 @@ export function resolveRerankModelForCli(): string {
 
 function resolveModelsForCli(): { embed: string; generate: string; rerank: string } {
   return ensureModelsConfiguredForCli();
+}
+
+/** Models that may actually be loaded. Falls back to defaults/env when a
+ *  project-local config's custom URIs are not trusted (#889). */
+function resolveModelsForRuntime(): { embed: string; generate: string; rerank: string } {
+  const configured = ensureModelsConfiguredForCli();
+  if (localConfigIsFullyTrusted()) return configured;
+  return resolveModels();
 }
 
 async function vectorIndex(
@@ -2453,14 +2698,11 @@ function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults
   return validated;
 }
 
-// Post-filter results to only include files from specified collections.
-function filterByCollections<T extends { filepath?: string; file?: string }>(results: T[], collectionNames: string[]): T[] {
-  if (collectionNames.length <= 1) return results;
-  const prefixes = collectionNames.map(n => `qmd://${n}/`);
-  return results.filter(r => {
-    const path = r.filepath || r.file || '';
-    return prefixes.some(p => path.startsWith(p));
-  });
+// Pass 0/1/N collection names through to store search (search each, then merge).
+function collectionSearchFilter(names: string[]): string | string[] | undefined {
+  if (names.length === 0) return undefined;
+  if (names.length === 1) return names[0];
+  return names;
 }
 
 /**
@@ -2559,14 +2801,10 @@ function search(query: string, opts: OutputOptions): void {
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
-    collectionNames
-  );
+  const results = searchFTS(db, query, fetchLimit, collectionSearchFilter(collectionNames));
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -2610,13 +2848,12 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   checkIndexHealth(store.db);
 
   await withLLMSession(async () => {
     let results = await vectorSearchQuery(store, query, {
-      collection: singleCollection,
+      collection: collectionSearchFilter(collectionNames),
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       intent: opts.intent,
@@ -2627,14 +2864,6 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
         },
       },
     });
-
-    // Post-filter for multi-collection
-    if (collectionNames.length > 1) {
-      results = results.filter(r => {
-        const prefixes = collectionNames.map(n => `qmd://${n}/`);
-        return prefixes.some(p => r.file.startsWith(p));
-      });
-    }
 
     closeDb();
 
@@ -2661,7 +2890,6 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   checkIndexHealth(store.db);
 
@@ -2691,7 +2919,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
 
       results = await structuredSearch(store, structuredQueries, {
-        collections: singleCollection ? [singleCollection] : undefined,
+        collections: collectionNames.length > 0 ? collectionNames : undefined,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -2719,7 +2947,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
     } else {
       // Standard hybrid query with automatic expansion
       results = await hybridQuery(store, query, {
-        collection: singleCollection,
+        collection: collectionSearchFilter(collectionNames),
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -2754,14 +2982,6 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
             process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
           },
         },
-      });
-    }
-
-    // Post-filter for multi-collection
-    if (collectionNames.length > 1) {
-      results = results.filter(r => {
-        const prefixes = collectionNames.map(n => `qmd://${n}/`);
-        return prefixes.some(p => r.file.startsWith(p));
       });
     }
 
@@ -2828,6 +3048,7 @@ function parseCLI() {
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
+      glob: { type: "string" },  // alias for --mask (OpenClaw / #536)
       // Embed options
       force: { type: "boolean", short: "f" },
       "max-docs-per-batch": { type: "string" },
@@ -2836,6 +3057,8 @@ function parseCLI() {
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
+      progress: { type: "boolean" },  // qmd pull: show node-llama-cpp download progress bar
+      "dry-run": { type: "boolean" },  // cleanup: report what would be removed
       // Get options
       l: { type: "string" },  // max lines
       from: { type: "string" },  // start line
@@ -3368,11 +3591,13 @@ function showHelp(): void {
   console.log("  qmd init                      - Create a project-local .qmd index");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
+  console.log("  qmd trust [list|revoke]       - Approve a checked-in .qmd config's hooks/paths/models");
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
-  console.log("  qmd cleanup                   - Clear caches, vacuum DB");
+  console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation/rerank models");
+  console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
   console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
@@ -4224,9 +4449,15 @@ if (isMain) {
         }
 
         case "add": {
-          const pwd = cli.args[1] || getPwd();
+          const pwd = cli.args[1];
+          if (!pwd) {
+            console.error("Usage: qmd collection add <path> [--name NAME] [--mask GLOB]");
+            console.error("  Pass '.' to index the current directory.");
+            console.error("  --mask / --glob: glob (default **/*.md), brace group, or comma-separated list");
+            process.exit(1);
+          }
           const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
-          const globPattern = cli.values.mask as string || DEFAULT_GLOB;
+          const globPattern = collectionGlobFromCli(cli.values);
           const name = cli.values.name as string | undefined;
 
           if (!existsSync(resolvedPwd)) {
@@ -4288,6 +4519,9 @@ if (isMain) {
             process.exit(1);
           }
           updateCollectionSettings(name, { update: cmd });
+          // The user just typed this command, so it needs no separate approval;
+          // re-record so the digest covers the new hook set (#886).
+          trustCurrentConfig();
           if (cmd) {
             console.log(`✓ Set update command for '${name}': ${cmd}`);
           } else {
@@ -4349,7 +4583,7 @@ if (isMain) {
           console.log("");
           console.log("Commands:");
           console.log("  list                      List all collections");
-          console.log("  add <path> [--name NAME]  Add a collection");
+          console.log("  add <path> [--name NAME] [--mask|--glob GLOB]  Add a collection");
           console.log("  remove <name>             Remove a collection");
           console.log("  rename <old> <new>        Rename a collection");
           console.log("  show <name>               Show collection details");
@@ -4359,6 +4593,7 @@ if (isMain) {
           console.log("");
           console.log("Examples:");
           console.log("  qmd collection add ~/notes --name notes");
+          console.log("  qmd collection add ~/notes --name notes --mask 'a.md,journals/*.md'");
           console.log("  qmd collection update-cmd brain 'git pull'");
           console.log("  qmd collection exclude archive");
           process.exit(0);
@@ -4393,8 +4628,13 @@ if (isMain) {
       await updateCollections();
       break;
 
+    case "trust":
+      manageTrust(cli.args[0]);
+      break;
+
     case "embed":
       try {
+        await resolveLocalConfigTrust();
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
@@ -4405,7 +4645,7 @@ if (isMain) {
         // embed operates on a single collection; only the first value is used.
         const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false);
         const embedCollection = embedValidatedCollections[0];
-        await vectorIndex(resolveEmbedModelForCli(), !!cli.values.force, {
+        await vectorIndex(resolveModelsForRuntime().embed, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
@@ -4418,8 +4658,9 @@ if (isMain) {
       break;
 
     case "pull": {
+      await resolveLocalConfigTrust();
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
-      const activeModels = resolveModelsForCli();
+      const activeModels = resolveModelsForRuntime();
       const models = [
         activeModels.embed,
         activeModels.generate,
@@ -4429,6 +4670,7 @@ if (isMain) {
       const results = await pullModels(models, {
         refresh,
         cacheDir: DEFAULT_MODEL_CACHE_DIR,
+        cli: Boolean(cli.values.progress),
       });
       for (const result of results) {
         const size = formatBytes(result.sizeBytes);
@@ -4456,6 +4698,7 @@ if (isMain) {
       if (!cli.values["min-score"]) {
         cli.opts.minScore = 0.3;
       }
+      await resolveLocalConfigTrust();
       await vectorSearch(cli.query, cli.opts);
       break;
 
@@ -4465,6 +4708,7 @@ if (isMain) {
         console.error("Usage: qmd query [options] <query>");
         process.exit(1);
       }
+      await resolveLocalConfigTrust();
       await querySearch(cli.query, cli.opts);
       break;
 
@@ -4479,12 +4723,16 @@ if (isMain) {
       }
       const { runBenchmark } = await import("../bench/bench.js");
       const benchCollection = cli.opts.collection;
-      await runBenchmark(fixturePath, {
-        json: !!cli.values.json,
-        collection: Array.isArray(benchCollection) ? benchCollection[0] : benchCollection,
-        dbPath: getDbPath(),
-        configPath: configExists() ? getConfigPath() : undefined,
-      });
+      try {
+        await runBenchmark(fixturePath, {
+          json: !!cli.values.json,
+          collection: Array.isArray(benchCollection) ? benchCollection[0] : benchCollection,
+          dbPath: getDbPath(),
+          configPath: configExists() ? getConfigPath() : undefined,
+        });
+      } catch (error) {
+        exitWithError(error);
+      }
       break;
     }
 
@@ -4657,28 +4905,42 @@ if (isMain) {
 
     case "cleanup": {
       const db = getDb();
+      const dryRun = Boolean(cli.values["dry-run"]);
 
-      // 1. Clear llm_cache
-      const cacheCount = deleteLLMCache(db);
-      console.log(`${c.green}✓${c.reset} Cleared ${cacheCount} cached API responses`);
+      if (dryRun) {
+        const stats = previewCleanup(db);
+        console.log("Dry run — no changes made.\n");
+        console.log(`Would clear ${stats.cacheCount} cached API responses`);
+        if (stats.orphanedVectors > 0) {
+          console.log(`Would remove ${stats.orphanedVectors} orphaned embedding chunks`);
+        } else {
+          console.log(`${c.dim}No orphaned embeddings to remove${c.reset}`);
+        }
+        if (stats.inactiveDocs > 0) {
+          console.log(`Would remove ${stats.inactiveDocs} inactive document records`);
+        }
+        if (stats.orphanedContent > 0) {
+          console.log(`Would remove ${stats.orphanedContent} orphaned content hashes`);
+        }
+        console.log("Would compact FTS and vacuum the database");
+        closeDb();
+        break;
+      }
 
-      // 2. Remove orphaned vectors
-      const orphanedVecs = cleanupOrphanedVectors(db);
-      if (orphanedVecs > 0) {
-        console.log(`${c.green}✓${c.reset} Removed ${orphanedVecs} orphaned embedding chunks`);
+      const stats = runCleanup(db);
+      console.log(`${c.green}✓${c.reset} Cleared ${stats.cacheCount} cached API responses`);
+      if (stats.orphanedVectors > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${stats.orphanedVectors} orphaned embedding chunks`);
       } else {
         console.log(`${c.dim}No orphaned embeddings to remove${c.reset}`);
       }
-
-      // 3. Remove inactive documents
-      const inactiveDocs = deleteInactiveDocuments(db);
-      if (inactiveDocs > 0) {
-        console.log(`${c.green}✓${c.reset} Removed ${inactiveDocs} inactive document records`);
+      if (stats.inactiveDocs > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${stats.inactiveDocs} inactive document records`);
       }
-
-      // 4. Vacuum to reclaim space
-      vacuumDatabase(db);
-      console.log(`${c.green}✓${c.reset} Database vacuumed`);
+      if (stats.orphanedContent > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${stats.orphanedContent} orphaned content hashes`);
+      }
+      console.log(`${c.green}✓${c.reset} FTS compacted, database vacuumed`);
 
       closeDb();
       break;
