@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.8.3] - 2026-08-16
+
 ### Security
 
 - `qmd update` no longer runs a project-local `.qmd/index.yml`'s `update:`
@@ -80,6 +82,15 @@
   runs and formats.
 
 ### Fixed
+
+- Concurrent first-open of a cold index no longer fails with
+  `table documents_fts already exists` on Bun/macOS. FTS5
+  `CREATE VIRTUAL TABLE IF NOT EXISTS` is not atomic across WAL
+  connections: two processes can both see a missing table on their
+  schema snapshot and the loser throws. Table create and legacy-schema
+  repair now use the same `BEGIN IMMEDIATE` + double-check as the FTS
+  sync triggers, and treat a concurrent "already exists" as success
+  when the table is present.
 
 - Nix flake `qmd-node-modules` FOD hashes updated for x86_64-linux and
   aarch64-darwin after the MCP SDK 2.0 bump. `nix build` / Nix GHA was
