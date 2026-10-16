@@ -8,18 +8,18 @@
 import { describe, test, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm.js";
 import { unlinkSync } from "node:fs";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import YAML from "yaml";
-import type { CollectionConfig } from "../src/collections";
-import { setConfigIndexName } from "../src/collections";
-import { syncConfigToDb } from "../src/store";
-import { initializeMetadataSchema } from "../src/metadata-store";
-import { VEC_TABLE, createVectorMetadataTables, vecLayout } from "../src/vec-layout";
-import { migrateVectorLayout } from "../src/store-migrations";
+import type { CollectionConfig } from "../src/collections.js";
+import { setConfigIndexName } from "../src/collections.js";
+import { syncConfigToDb } from "../src/store.js";
+import { initializeMetadataSchema } from "../src/metadata-store.js";
+import { VEC_TABLE, createVectorMetadataTables, vecLayout } from "../src/vec-layout.js";
+import { migrateVectorLayout } from "../src/store-migrations.js";
 
 // =============================================================================
 // Test Database Setup
@@ -225,8 +225,8 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
-} from "../src/store";
-import type { RankedResult } from "../src/store";
+} from "../src/store.js";
+import type { RankedResult } from "../src/store.js";
 // Note: searchResultsToMcpCsv no longer used in MCP - using structuredContent instead
 
 // =============================================================================
@@ -942,8 +942,8 @@ describe("MCP Server", () => {
 // HTTP Transport Tests
 // =============================================================================
 
-import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server";
-import { _resetProductionModeForTesting } from "../src/store";
+import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server.js";
+import { _resetProductionModeForTesting } from "../src/store.js";
 
 describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
   let handle: HttpServerHandle;
@@ -1028,7 +1028,7 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     const res = await fetch(`${baseUrl}/health`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("application/json");
-    const body = await res.json();
+    const body = await res.json() as { status?: string; uptime?: unknown };
     expect(body.status).toBe("ok");
     expect(typeof body.uptime).toBe("number");
   });
@@ -1045,7 +1045,7 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
       body: "{not valid json",
     });
     expect(malformed.status).toBe(400);
-    expect((await malformed.json()).error).toBe("Invalid JSON body");
+    expect((await malformed.json() as { error?: string }).error).toBe("Invalid JSON body");
 
     const nonObject = await fetch(`${baseUrl}/query`, {
       method: "POST",
@@ -1053,7 +1053,7 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
       body: "null",
     });
     expect(nonObject.status).toBe(400);
-    expect((await nonObject.json()).error).toBe("JSON body must be an object");
+    expect((await nonObject.json() as { error?: string }).error).toBe("JSON body must be an object");
   });
 
   // ---------------------------------------------------------------------------
